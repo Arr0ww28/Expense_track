@@ -4,11 +4,32 @@ import datetime
 import os
 import ollama
 import yfinance as yf
+import re
+import requests
 
 # Configuration
 EXCEL_FILE = "finance_tracker.xlsx"
 LLM_MODEL = "qwen3-coder:latest"
 
+#api req for live stock rates
+def search_ticker(query):
+    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
+    # Yahoo Finance API requires a standard User-Agent header to prevent blocking
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'} 
+    try:
+        response = requests.get(url, headers=headers)
+        data = response.json()
+        results = []
+        for quote in data.get('quotes', [])[:10]:
+            symbol = quote.get('symbol', '')
+            shortname = quote.get('shortname', 'Unknown')
+            exchange = quote.get('exchange', 'Unknown Exchange')
+            if symbol:
+                results.append(f"{shortname} ({symbol}) - {exchange}")
+        return results
+    except Exception:
+        return []
+    
 #live stock rates
 def init_watchlist():
     if 'watchlist' not in st.session_state:
@@ -170,24 +191,37 @@ with tab3:
 
 # TAB 4: LIVE STOCK RATES
 with tab4:
-    st.subheader("Live Stock Rates")
-    st.info("Data fetched via Yahoo Finance. This data is session-only and not saved to Excel.")
+    st.subheader("Live Stock Rates & Ticker Lookup")
+    st.info("Search for a company or fund name to find its ticker and add it to your watchlist. Data fetched via Yahoo Finance. This data is session-only and not saved to Excel.")
     
-    col_input, col_btn = st.columns([3, 1])
-    with col_input:
-        new_ticker = st.text_input("Add Ticker Symbol (e.g., INFY.NS, MSFT)", "").upper()
-    with col_btn:
-        st.write("") 
-        st.write("") 
-        if st.button("Add Ticker"):
-            if new_ticker and new_ticker not in st.session_state.watchlist:
-                st.session_state.watchlist.append(new_ticker)
-                st.rerun()
-            elif new_ticker in st.session_state.watchlist:
-                st.warning("Ticker already in watchlist.")
+    # 1. Search UI
+    search_query = st.text_input("Search Company or Fund Name (e.g., Nippon Goldbees, Reliance)")
+    
+    if st.button("Search"):
+        if search_query:
+            st.session_state.search_results = search_ticker(search_query)
+        else:
+            st.warning("Please enter a search term.")
 
+    # 2. Select & Add UI
+    if 'search_results' in st.session_state and st.session_state.search_results:
+        selected_option = st.selectbox("Select the correct ticker:", st.session_state.search_results)
+        
+        if st.button("Add to Watchlist"):
+            # Extract the symbol from between the parentheses
+            match = re.search(r'\((.*?)\)', selected_option)
+            if match:
+                extracted_ticker = match.group(1)
+                if extracted_ticker not in st.session_state.watchlist:
+                    st.session_state.watchlist.append(extracted_ticker)
+                    st.session_state.search_results = [] # Clear search results after adding
+                    st.rerun()
+                else:
+                    st.warning("Ticker already in watchlist.")
+                    
     st.divider()
 
+    # 3. Watchlist Grid UI
     if st.button("Refresh Prices"):
         st.rerun()
 
