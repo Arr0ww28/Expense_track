@@ -3,62 +3,118 @@ import pandas as pd
 import datetime
 import os
 import ollama
+import yfinance as yf
 
 # Configuration
 EXCEL_FILE = "finance_tracker.xlsx"
 LLM_MODEL = "qwen3-coder:latest"
 
-# --- EXCEL INITIALIZATION ---
-def init_excel():
+#live stock rates
+def init_watchlist():
+    if 'watchlist' not in st.session_state:
+        st.session_state.watchlist = ["RELIANCE.NS", "TCS.NS", "AAPL"]
+
+def get_live_stock_data(ticker_symbol):
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        todays_data = ticker.history(period='5d') # 5 days handles weekends/holidays
+        if len(todays_data) < 2:
+            return None
+        
+        current_price = todays_data['Close'].iloc[-1]
+        prev_close = todays_data['Close'].iloc[-2]
+        change = current_price - prev_close
+        pct_change = (change / prev_close * 100) if prev_close != 0 else 0
+        
+        return current_price, change, pct_change
+    except Exception:
+        return None
+
+# Call initialization
+init_watchlist()
+    
+# --- STATE & EXCEL MANAGEMENT ---
+def init_data():
     if not os.path.exists(EXCEL_FILE):
         with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
             pd.DataFrame(columns=["Sr No", "Date", "Salary Credited"]).to_excel(writer, sheet_name="MAIN SALARY", index=False)
             pd.DataFrame(columns=["Sr No", "Date", "Expense Type", "Amount"]).to_excel(writer, sheet_name="EXPENSES", index=False)
             pd.DataFrame(columns=["Sr No", "Date", "Share/Fund Name", "Quantity", "Total Amount Invested"]).to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
+    
+    if 'data' not in st.session_state:
+        st.session_state.data = {
+            "MAIN SALARY": pd.read_excel(EXCEL_FILE, sheet_name="MAIN SALARY"),
+            "EXPENSES": pd.read_excel(EXCEL_FILE, sheet_name="EXPENSES"),
+            "SHARES and FUNDS": pd.read_excel(EXCEL_FILE, sheet_name="SHARES and FUNDS")
+        }
 
-def get_next_sr_no(df):
+def save_all_to_excel():
+    try:
+        with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="w") as writer:
+            st.session_state.data["MAIN SALARY"].to_excel(writer, sheet_name="MAIN SALARY", index=False)
+            st.session_state.data["EXPENSES"].to_excel(writer, sheet_name="EXPENSES", index=False)
+            st.session_state.data["SHARES and FUNDS"].to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
+        return True, "Data synced to Excel successfully."
+    except PermissionError:
+        return False, "Permission Denied: Please close the Excel file to allow background saving. Data saved in memory."
+    except Exception as e:
+        return False, f"Error saving to Excel: {str(e)}"
+
+def get_next_sr_no(df_name):
+    df = st.session_state.data[df_name]
     return 1 if df.empty else int(df["Sr No"].max()) + 1
 
-def load_data(sheet_name):
-    return pd.read_excel(EXCEL_FILE, sheet_name=sheet_name)
-
-def save_data(df, sheet_name):
-    with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-
 # --- AI INSIGHTS ---
-def get_ai_insights(salary_df, expenses_df, shares_df):
-    total_salary = salary_df["Salary Credited"].sum()
-    total_expenses = expenses_df["Amount"].sum()
-    total_investments = shares_df["Total Amount Invested"].sum()
+def get_ai_insights():
+    df_salary = st.session_state.data["MAIN SALARY"]
+    df_exp = st.session_state.data["EXPENSES"]
+    df_shares = st.session_state.data["SHARES and FUNDS"]
     
-    expense_breakdown = expenses_df.groupby('Expense Type')['Amount'].sum().to_string() if not expenses_df.empty else "No expenses logged."
+    total_salary = df_salary["Salary Credited"].sum()
+    total_expenses = df_exp["Amount"].sum()
+    total_investments = df_shares["Total Amount Invested"].sum()
+    
+    # Enhanced Context
+    df_exp['Date'] = pd.to_datetime(df_exp['Date'])
+    recent_expenses = df_exp.sort_values(by='Date', ascending=False).head(5)[['Date', 'Expense Type', 'Amount']].to_string(index=False) if not df_exp.empty else "No recent expenses."
+    
+    current_month = datetime.date.today().month
+    this_month_exp = df_exp[df_exp['Date'].dt.month == current_month]['Amount'].sum() if not df_exp.empty else 0
+    
+    top_categories = df_exp.groupby('Expense Type')['Amount'].sum().sort_values(ascending=False).head(3).to_string() if not df_exp.empty else "None"
     
     prompt = f"""
-    You are an expert financial advisor. Analyze the following financial summary:
+    You are an expert financial advisor. Analyze this financial data:
+    
+    OVERALL TOTALS:
     - Total Salary: {total_salary}
     - Total Expenses: {total_expenses}
     - Total Investments: {total_investments}
+    - Expenses This Month: {this_month_exp}
     
-    Expense Categories Breakdown:
-    {expense_breakdown}
+    TOP 3 EXPENSE CATEGORIES:
+    {top_categories}
     
-    Provide 3-4 bullet points of brief, actionable financial advice. Keep the response direct and analytical.
+    5 MOST RECENT TRANSACTIONS:
+    {recent_expenses}
+    
+    REMEMBER: ALL THE EXPENSES AND INCOME IS IN RUPEES.
+    Provide 3-4 bullet points of brief, actionable financial advice based on recent spending trends and overall balance. Keep it analytical and direct.
     """
     
     try:
         response = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
         return response['message']['content']
     except Exception as e:
-        return f"Error connecting to Ollama: {str(e)}. Ensure Ollama is running with the '{LLM_MODEL}' model locally."
+        return f"Error connecting to Ollama: {str(e)}. Ensure Ollama is running."
 
 # --- UI LAYOUT ---
 st.set_page_config(page_title="AI Finance Tracker", layout="wide")
-init_excel()
+init_data()
 
-st.title("Salary & Expense Tracker")
+st.title("AI Salary & Expense Tracker")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Main Salary", "Expenses", "Shares & Funds", "Dashboard & AI Insights"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Main Salary", "Expenses", "Shares & Funds", "Live stock rates", "Manage Data (CRUD)", "Dashboard & AI"])
 
 system_date = datetime.date.today().strftime("%Y-%m-%d")
 
@@ -68,11 +124,10 @@ with tab1:
     salary_amount = st.number_input("Salary Credited Amount", min_value=0.0, format="%.2f", step=100.0)
     
     if st.button("Add Salary"):
-        df_salary = load_data("MAIN SALARY")
-        new_row = {"Sr No": get_next_sr_no(df_salary), "Date": system_date, "Salary Credited": salary_amount}
-        df_salary = pd.concat([df_salary, pd.DataFrame([new_row])], ignore_index=True)
-        save_data(df_salary, "MAIN SALARY")
-        st.success("Salary entry added successfully.")
+        new_row = {"Sr No": get_next_sr_no("MAIN SALARY"), "Date": system_date, "Salary Credited": salary_amount}
+        st.session_state.data["MAIN SALARY"] = pd.concat([st.session_state.data["MAIN SALARY"], pd.DataFrame([new_row])], ignore_index=True)
+        success, msg = save_all_to_excel()
+        st.success("Added! " + msg) if success else st.warning("Added! " + msg)
 
 # TAB 2: EXPENSES
 with tab2:
@@ -90,11 +145,10 @@ with tab2:
     
     if st.button("Add Expense"):
         if exp_type:
-            df_exp = load_data("EXPENSES")
-            new_row = {"Sr No": get_next_sr_no(df_exp), "Date": exp_date, "Expense Type": exp_type, "Amount": exp_amount}
-            df_exp = pd.concat([df_exp, pd.DataFrame([new_row])], ignore_index=True)
-            save_data(df_exp, "EXPENSES")
-            st.success("Expense logged successfully.")
+            new_row = {"Sr No": get_next_sr_no("EXPENSES"), "Date": exp_date, "Expense Type": exp_type, "Amount": exp_amount}
+            st.session_state.data["EXPENSES"] = pd.concat([st.session_state.data["EXPENSES"], pd.DataFrame([new_row])], ignore_index=True)
+            success, msg = save_all_to_excel()
+            st.success("Logged! " + msg) if success else st.warning("Logged! " + msg)
         else:
             st.warning("Please specify a valid expense category.")
 
@@ -107,24 +161,82 @@ with tab3:
     
     if st.button("Add Investment"):
         if share_name:
-            df_shares = load_data("SHARES and FUNDS")
-            new_row = {"Sr No": get_next_sr_no(df_shares), "Date": system_date, "Share/Fund Name": share_name, "Quantity": share_qty, "Total Amount Invested": share_amount}
-            df_shares = pd.concat([df_shares, pd.DataFrame([new_row])], ignore_index=True)
-            save_data(df_shares, "SHARES and FUNDS")
-            st.success("Investment logged successfully.")
+            new_row = {"Sr No": get_next_sr_no("SHARES and FUNDS"), "Date": system_date, "Share/Fund Name": share_name, "Quantity": share_qty, "Total Amount Invested": share_amount}
+            st.session_state.data["SHARES and FUNDS"] = pd.concat([st.session_state.data["SHARES and FUNDS"], pd.DataFrame([new_row])], ignore_index=True)
+            success, msg = save_all_to_excel()
+            st.success("Invested! " + msg) if success else st.warning("Invested! " + msg)
         else:
             st.warning("Please enter the name of the share or fund.")
 
-# TAB 4: DASHBOARD & AI
+# TAB 4: LIVE STOCK RATES
 with tab4:
-    st.subheader("Financial Overview")
-    df_salary = load_data("MAIN SALARY")
-    df_exp = load_data("EXPENSES")
-    df_shares = load_data("SHARES and FUNDS")
+    st.subheader("Live Stock Rates")
+    st.info("Data fetched via Yahoo Finance. This data is session-only and not saved to Excel.")
     
-    total_salary = df_salary["Salary Credited"].sum()
-    total_exp = df_exp["Amount"].sum()
-    total_inv = df_shares["Total Amount Invested"].sum()
+    col_input, col_btn = st.columns([3, 1])
+    with col_input:
+        new_ticker = st.text_input("Add Ticker Symbol (e.g., INFY.NS, MSFT)", "").upper()
+    with col_btn:
+        st.write("") 
+        st.write("") 
+        if st.button("Add Ticker"):
+            if new_ticker and new_ticker not in st.session_state.watchlist:
+                st.session_state.watchlist.append(new_ticker)
+                st.rerun()
+            elif new_ticker in st.session_state.watchlist:
+                st.warning("Ticker already in watchlist.")
+
+    st.divider()
+
+    if st.button("Refresh Prices"):
+        st.rerun()
+
+    if not st.session_state.watchlist:
+        st.write("Your watchlist is empty.")
+    else:
+        cols = st.columns(3)
+        for i, ticker in enumerate(st.session_state.watchlist):
+            col = cols[i % 3]
+            with col:
+                st.write(f"**{ticker}**")
+                data = get_live_stock_data(ticker)
+                
+                if data:
+                    current_price, change, pct_change = data
+                    st.metric(
+                        label="Price",
+                        value=f"{current_price:.2f}",
+                        delta=f"{change:.2f} ({pct_change:.2f}%)"
+                    )
+                else:
+                    st.error("Data unavailable")
+                
+                if st.button("Remove", key=f"remove_{ticker}"):
+                    st.session_state.watchlist.remove(ticker)
+                    st.rerun()
+                st.write("---")
+
+# TAB 5: MANAGE DATA (CRUD)
+with tab5:
+    st.subheader("Edit or Delete Records")
+    st.info("Edit cells directly or select rows to delete. Click 'Save Changes' to update the Excel file.")
+    
+    sheet_choice = st.selectbox("Select Sheet to Edit", ["MAIN SALARY", "EXPENSES", "SHARES and FUNDS"])
+    
+    edited_df = st.data_editor(st.session_state.data[sheet_choice], num_rows="dynamic", use_container_width=True)
+    
+    if st.button("Save Changes to Excel"):
+        st.session_state.data[sheet_choice] = edited_df
+        success, msg = save_all_to_excel()
+        st.success(msg) if success else st.error(msg)
+
+# TAB 5: DASHBOARD & AI
+with tab6:
+    st.subheader("Financial Overview")
+    
+    total_salary = st.session_state.data["MAIN SALARY"]["Salary Credited"].sum()
+    total_exp = st.session_state.data["EXPENSES"]["Amount"].sum()
+    total_inv = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
     balance = total_salary - total_exp - total_inv
     
     col1, col2, col3, col4 = st.columns(4)
@@ -135,15 +247,15 @@ with tab4:
     
     st.divider()
     
-    if not df_exp.empty:
+    if not st.session_state.data["EXPENSES"].empty:
         st.write("**Expense Distribution**")
-        cat_exp = df_exp.groupby("Expense Type")["Amount"].sum().reset_index()
+        cat_exp = st.session_state.data["EXPENSES"].groupby("Expense Type")["Amount"].sum().reset_index()
         st.bar_chart(cat_exp.set_index("Expense Type"))
         
     st.divider()
     
     st.subheader("Qwen3 Coder AI Insights")
     if st.button("Analyze My Finances"):
-        with st.spinner("Generating insights..."):
-            insights = get_ai_insights(df_salary, df_exp, df_shares)
+        with st.spinner("Analyzing recent trends..."):
+            insights = get_ai_insights()
             st.markdown(insights)

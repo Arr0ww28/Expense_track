@@ -1,0 +1,6 @@
+@echo off
+echo Starting Ollama server...
+start /b ollama serve
+timeout /t 3 /nobreak > NUL
+echo Launching Streamlit app...
+streamlit run app.py
