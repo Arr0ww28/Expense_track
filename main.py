@@ -6,29 +6,44 @@ import ollama
 import yfinance as yf
 import re
 import requests
+import urllib3
+from curl_cffi import requests
+
 
 # Configuration
 EXCEL_FILE = "finance_tracker.xlsx"
 LLM_MODEL = "qwen3-coder:latest"
 
-#api req for live stock rates
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 def search_ticker(query):
-    url = f"https://query2.finance.yahoo.com/v1/finance/search?q={query}"
-    # Yahoo Finance API requires a standard User-Agent header to prevent blocking
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'} 
-    try:
-        response = requests.get(url, headers=headers)
+    
+    def fetch_results(search_term):
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={search_term}"
+        response = requests.get(url, headers=headers, verify=False)
+        response.raise_for_status()
         data = response.json()
         results = []
         for quote in data.get('quotes', [])[:10]:
             symbol = quote.get('symbol', '')
-            shortname = quote.get('shortname', 'Unknown')
-            exchange = quote.get('exchange', 'Unknown Exchange')
             if symbol:
-                results.append(f"{shortname} ({symbol}) - {exchange}")
+                results.append(f"{quote.get('shortname', 'Unknown')} ({symbol}) - {quote.get('exchange', 'Unknown')}")
         return results
-    except Exception:
-        return []
+
+    try:
+        # Try the exact user query first
+        results = fetch_results(query)
+        
+        # Fallback: If empty, try searching just the last word (e.g., 'Goldbees' from 'Nippon Goldbees')
+        if not results and " " in query:
+            fallback_query = query.split()[-1] 
+            results = fetch_results(fallback_query)
+            
+        return results, None
+    except Exception as e:
+        return [], str(e)
     
 #live stock rates
 def init_watchlist():
@@ -37,18 +52,25 @@ def init_watchlist():
 
 def get_live_stock_data(ticker_symbol):
     try:
-        ticker = yf.Ticker(ticker_symbol)
-        todays_data = ticker.history(period='5d') # 5 days handles weekends/holidays
+        # Create a curl_cffi session that ignores SSL verification
+        session = requests.Session(impersonate="chrome")
+        session.verify = False
+        
+        # Pass the curl_cffi session to yfinance
+        ticker = yf.Ticker(ticker_symbol, session=session)
+        todays_data = ticker.history(period='5d')
+        
         if len(todays_data) < 2:
             return None
         
         current_price = todays_data['Close'].iloc[-1]
         prev_close = todays_data['Close'].iloc[-2]
         change = current_price - prev_close
-        pct_change = (change / prev_close * 100) if prev_close != 0 else 0
+        pct_change = (change / prev_close) * 100
         
         return current_price, change, pct_change
-    except Exception:
+    except Exception as e:
+        print(f"Error fetching {ticker_symbol}: {e}")
         return None
 
 # Call initialization
@@ -104,23 +126,25 @@ def get_ai_insights():
     
     top_categories = df_exp.groupby('Expense Type')['Amount'].sum().sort_values(ascending=False).head(3).to_string() if not df_exp.empty else "None"
     
-    prompt = f"""
-    You are an expert financial advisor. Analyze this financial data:
-    
-    OVERALL TOTALS:
-    - Total Salary: {total_salary}
-    - Total Expenses: {total_expenses}
-    - Total Investments: {total_investments}
-    - Expenses This Month: {this_month_exp}
-    
-    TOP 3 EXPENSE CATEGORIES:
-    {top_categories}
-    
-    5 MOST RECENT TRANSACTIONS:
-    {recent_expenses}
-    
-    REMEMBER: ALL THE EXPENSES AND INCOME IS IN RUPEES.
-    Provide 3-4 bullet points of brief, actionable financial advice based on recent spending trends and overall balance. Keep it analytical and direct.
+    prompt = f"""You are an expert financial advisor. Analyze the following financial data and provide direct, actionable advice. 
+
+### FINANCIAL DATA (All values in ₹ INR)
+* **Total Salary:** ₹{total_salary}
+* **Total Expenses:** ₹{total_expenses}
+* **Total Investments:** ₹{total_investments}
+* **Expenses This Month:** ₹{this_month_exp}
+
+### TOP 3 EXPENSE CATEGORIES
+{top_categories}
+
+### 5 MOST RECENT TRANSACTIONS
+{recent_expenses}
+
+### OUTPUT INSTRUCTIONS
+1. Provide exactly 3 to 4 bullet points of analytical financial advice.
+2. Focus on recent spending trends, category optimization, and the overall balance.
+3. Use **bold text** to highlight key metrics, specific categories, or critical actions to ensure high readability.
+4. Output ONLY the bullet points. Do not include any introductory phrases, pleasantries, or concluding summaries.
     """
     
     try:
@@ -133,11 +157,68 @@ def get_ai_insights():
 st.set_page_config(page_title="AI Finance Tracker", layout="wide")
 init_data()
 
-st.title("AI Salary & Expense Tracker")
+st.title("Salary & Expense Tracker")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Main Salary", "Expenses", "Shares & Funds", "Live stock rates", "Manage Data (CRUD)", "Dashboard & AI"])
+tab1, tab2, tab3, tab5, tab6 = st.tabs(["Main Salary", "Expenses", "Shares & Funds", "Manage Data (CRUD)", "Dashboard & AI"])
 
 system_date = datetime.date.today().strftime("%Y-%m-%d")
+
+with st.sidebar:
+    # Using st.popover creates a clickable button (like an icon) that expands to show content
+        st.info("Session-only data fetched via Yahoo Finance.")
+        
+        search_query = st.text_input("Search Company/Fund")
+        if st.button("Search"):
+            if search_query:
+                results, error_msg = search_ticker(search_query)
+                if error_msg:
+                    st.error(f"Error: {error_msg}")
+                elif not results:
+                    st.warning("No results.")
+                else:
+                    st.session_state.search_results = results
+
+        if 'search_results' in st.session_state and st.session_state.search_results:
+            selected_option = st.selectbox("Select ticker:", st.session_state.search_results)
+            if st.button("Add to Watchlist"):
+                import re
+                match = re.search(r'\((.*?)\)', selected_option)
+                if match:
+                    extracted_ticker = match.group(1)
+                    if extracted_ticker not in st.session_state.watchlist:
+                        st.session_state.watchlist.append(extracted_ticker)
+                        st.session_state.search_results = [] 
+                        st.rerun()
+                    else:
+                        st.warning("Already in watchlist.")
+                        
+        st.divider()
+
+        if st.button("Refresh Prices", use_container_width=True):
+            st.rerun()
+
+        if not st.session_state.watchlist:
+            st.write("Watchlist is empty.")
+        else:
+            for ticker in st.session_state.watchlist:
+                container = st.container(border=True)
+                with container:
+                    st.write(f"**{ticker}**")
+                    data = get_live_stock_data(ticker)
+                    
+                    if data:
+                        current_price, change, pct_change = data
+                        st.metric(
+                            label="Price",
+                            value=f"{current_price:.2f}",
+                            delta=f"{change:.2f} ({pct_change:.2f}%)"
+                        )
+                    else:
+                        st.error("Data unavailable")
+                    
+                    if st.button("Remove", key=f"remove_{ticker}", use_container_width=True):
+                        st.session_state.watchlist.remove(ticker)
+                        st.rerun()
 
 # TAB 1: MAIN SALARY
 with tab1:
@@ -189,66 +270,6 @@ with tab3:
         else:
             st.warning("Please enter the name of the share or fund.")
 
-# TAB 4: LIVE STOCK RATES
-with tab4:
-    st.subheader("Live Stock Rates & Ticker Lookup")
-    st.info("Search for a company or fund name to find its ticker and add it to your watchlist. Data fetched via Yahoo Finance. This data is session-only and not saved to Excel.")
-    
-    # 1. Search UI
-    search_query = st.text_input("Search Company or Fund Name (e.g., Nippon Goldbees, Reliance)")
-    
-    if st.button("Search"):
-        if search_query:
-            st.session_state.search_results = search_ticker(search_query)
-        else:
-            st.warning("Please enter a search term.")
-
-    # 2. Select & Add UI
-    if 'search_results' in st.session_state and st.session_state.search_results:
-        selected_option = st.selectbox("Select the correct ticker:", st.session_state.search_results)
-        
-        if st.button("Add to Watchlist"):
-            # Extract the symbol from between the parentheses
-            match = re.search(r'\((.*?)\)', selected_option)
-            if match:
-                extracted_ticker = match.group(1)
-                if extracted_ticker not in st.session_state.watchlist:
-                    st.session_state.watchlist.append(extracted_ticker)
-                    st.session_state.search_results = [] # Clear search results after adding
-                    st.rerun()
-                else:
-                    st.warning("Ticker already in watchlist.")
-                    
-    st.divider()
-
-    # 3. Watchlist Grid UI
-    if st.button("Refresh Prices"):
-        st.rerun()
-
-    if not st.session_state.watchlist:
-        st.write("Your watchlist is empty.")
-    else:
-        cols = st.columns(3)
-        for i, ticker in enumerate(st.session_state.watchlist):
-            col = cols[i % 3]
-            with col:
-                st.write(f"**{ticker}**")
-                data = get_live_stock_data(ticker)
-                
-                if data:
-                    current_price, change, pct_change = data
-                    st.metric(
-                        label="Price",
-                        value=f"{current_price:.2f}",
-                        delta=f"{change:.2f} ({pct_change:.2f}%)"
-                    )
-                else:
-                    st.error("Data unavailable")
-                
-                if st.button("Remove", key=f"remove_{ticker}"):
-                    st.session_state.watchlist.remove(ticker)
-                    st.rerun()
-                st.write("---")
 
 # TAB 5: MANAGE DATA (CRUD)
 with tab5:
@@ -257,7 +278,7 @@ with tab5:
     
     sheet_choice = st.selectbox("Select Sheet to Edit", ["MAIN SALARY", "EXPENSES", "SHARES and FUNDS"])
     
-    edited_df = st.data_editor(st.session_state.data[sheet_choice], num_rows="dynamic", use_container_width=True)
+    edited_df = edited_df = st.data_editor(st.session_state.data[sheet_choice], num_rows="dynamic", width="stretch")
     
     if st.button("Save Changes to Excel"):
         st.session_state.data[sheet_choice] = edited_df
