@@ -77,12 +77,30 @@ def get_live_stock_data(ticker_symbol):
 init_watchlist()
     
 # --- STATE & EXCEL MANAGEMENT ---
+CUSTOM_CATEGORIES_FILE = "custom_categories.json"
+
+def load_custom_categories():
+    if 'custom_categories' not in st.session_state:
+        if os.path.exists(CUSTOM_CATEGORIES_FILE):
+            import json
+            with open(CUSTOM_CATEGORIES_FILE, 'r') as f:
+                st.session_state.custom_categories = json.load(f)
+        else:
+            st.session_state.custom_categories = []
+
+def save_custom_categories():
+    import json
+    with open(CUSTOM_CATEGORIES_FILE, 'w') as f:
+        json.dump(st.session_state.custom_categories, f)
+
 def init_data():
     if not os.path.exists(EXCEL_FILE):
         with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
             pd.DataFrame(columns=["Sr No", "Date", "Salary Credited"]).to_excel(writer, sheet_name="MAIN SALARY", index=False)
-            pd.DataFrame(columns=["Sr No", "Date", "Expense Type", "Amount"]).to_excel(writer, sheet_name="EXPENSES", index=False)
+            pd.DataFrame(columns=["Sr No", "Date", "Expense Type", "Amount", "Notes"]).to_excel(writer, sheet_name="EXPENSES", index=False)
             pd.DataFrame(columns=["Sr No", "Date", "Share/Fund Name", "Quantity", "Total Amount Invested"]).to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
+    
+    load_custom_categories()
     
     if 'data' not in st.session_state:
         st.session_state.data = {
@@ -91,6 +109,15 @@ def init_data():
             "SHARES and FUNDS": pd.read_excel(EXCEL_FILE, sheet_name="SHARES and FUNDS")
         }
 
+        # --- FIX: Robust Date Cleaning ---
+        for sheet in st.session_state.data:
+            df = st.session_state.data[sheet]
+            if "Date" in df.columns and not df.empty:
+                # 'format=mixed' handles different strings, 'errors=coerce' prevents crashing on bad data
+                df["Date"] = pd.to_datetime(df["Date"], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
+                # Fill any failed conversions with today's date so the app doesn't break
+                df["Date"] = df["Date"].fillna(datetime.date.today().strftime("%Y-%m-%d"))
+                st.session_state.data[sheet] = df
 def save_all_to_excel():
     try:
         with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="w") as writer:
@@ -141,10 +168,12 @@ def get_ai_insights():
 {recent_expenses}
 
 ### OUTPUT INSTRUCTIONS
-1. Provide exactly 3 to 4 bullet points of analytical financial advice.
-2. Focus on recent spending trends, category optimization, and the overall balance.
-3. Use **bold text** to highlight key metrics, specific categories, or critical actions to ensure high readability.
-4. Output ONLY the bullet points. Do not include any introductory phrases, pleasantries, or concluding summaries.
+1.Analyze the user's financial data and provide insights on their spending habits and how they can optimize their finances.
+2.Advice on how to save better with their given salary and expenses.
+3.Help them invest wisely based on the current market trends and their financial behavior.
+4. Use **bold text** to highlight key metrics, specific categories, or critical actions to ensure high readability.
+5. Structure it like a finance report for easy understanding. Avoid generic advice and focus on personalized, actionable insights based on the provided data.
+6. Ensure the report is easy to read and understand, even for someone without a financial background. Use simple language and avoid jargon.
     """
     
     try:
@@ -235,20 +264,38 @@ with tab1:
 with tab2:
     st.subheader("Log an Expense")
     use_custom_date = st.checkbox("Use custom date")
-    exp_date = st.date_input("Expense Date").strftime("%Y-%m-%d") if use_custom_date else system_date
     
-    expense_categories = ["Rent", "Groceries", "Utilities", "Transport", "Entertainment", "Custom..."]
+    # Ensure raw_date is always a date object
+    if use_custom_date:
+        raw_date = st.date_input("Expense Date", value=datetime.date.today())
+    else:
+        raw_date = datetime.date.today()
+    
+    # Format strictly as YYYY-MM-DD string
+    exp_date = raw_date.strftime("%Y-%m-%d")
+    
+    expense_categories = ["Rent", "Groceries", "Utilities", "Transport", "Entertainment"] + st.session_state.custom_categories + ["Custom..."]
     exp_type = st.selectbox("Type of Expense", expense_categories)
     
     if exp_type == "Custom...":
         exp_type = st.text_input("Enter Custom Category")
         
     exp_amount = st.number_input("Amount Spent", min_value=0.0, format="%.2f", step=10.0)
+    exp_notes = st.text_area("Notes (optional)", placeholder="Add any notes about this expense...")
     
     if st.button("Add Expense"):
         if exp_type:
-            new_row = {"Sr No": get_next_sr_no("EXPENSES"), "Date": exp_date, "Expense Type": exp_type, "Amount": exp_amount}
+            if exp_type not in ["Rent", "Groceries", "Utilities", "Transport", "Entertainment"] and exp_type not in st.session_state.custom_categories:
+                st.session_state.custom_categories.append(exp_type)
+                save_custom_categories()
+            
+            # Create new row with formatted date string
+            new_row = {"Sr No": get_next_sr_no("EXPENSES"), "Date": exp_date, "Expense Type": exp_type, "Amount": exp_amount, "Notes": exp_notes}
             st.session_state.data["EXPENSES"] = pd.concat([st.session_state.data["EXPENSES"], pd.DataFrame([new_row])], ignore_index=True)
+            
+            # Force the entire column to string format to prevent Excel/Pandas from adding 00:00:00
+            st.session_state.data["EXPENSES"]["Date"] = st.session_state.data["EXPENSES"]["Date"].astype(str)
+            
             success, msg = save_all_to_excel()
             st.success("Logged! " + msg) if success else st.warning("Logged! " + msg)
         else:
@@ -257,18 +304,46 @@ with tab2:
 # TAB 3: SHARES & FUNDS
 with tab3:
     st.subheader("Log Investment")
-    share_name = st.text_input("Share / Fund Name")
+    
+    # Get unique names already used in the "SHARES and FUNDS" sheet
+    existing_investments = []
+    if not st.session_state.data["SHARES and FUNDS"].empty:
+        existing_investments = sorted(st.session_state.data["SHARES and FUNDS"]["Share/Fund Name"].unique().tolist())
+    
+    # Create the selection list
+    investment_options = existing_investments + ["New..."]
+    
+    # Use a selectbox for auto-suggestions
+    selected_investment = st.selectbox("Select or Search Investment", investment_options, index=len(investment_options)-1 if not existing_investments else 0)
+    
+    # If "New..." is selected, show a text input
+    if selected_investment == "New...":
+        share_name = st.text_input("Enter New Share / Fund Name")
+    else:
+        share_name = selected_investment
+
     share_qty = st.number_input("Quantity", min_value=0.0, format="%.4f", step=1.0)
     share_amount = st.number_input("Total Amount Invested", min_value=0.0, format="%.2f", step=50.0)
     
     if st.button("Add Investment"):
         if share_name:
-            new_row = {"Sr No": get_next_sr_no("SHARES and FUNDS"), "Date": system_date, "Share/Fund Name": share_name, "Quantity": share_qty, "Total Amount Invested": share_amount}
+            # Format current date strictly
+            clean_date = datetime.date.today().strftime("%Y-%m-%d")
+
+            new_row = {
+                "Sr No": get_next_sr_no("SHARES and FUNDS"), 
+                "Date": clean_date, 
+                "Share/Fund Name": share_name, 
+                "Quantity": share_qty, 
+                "Total Amount Invested": share_amount
+            }
             st.session_state.data["SHARES and FUNDS"] = pd.concat([st.session_state.data["SHARES and FUNDS"], pd.DataFrame([new_row])], ignore_index=True)
+
+            # Prevent conversion back to datetime objects
+            st.session_state.data["SHARES and FUNDS"]["Date"] = st.session_state.data["SHARES and FUNDS"]["Date"].astype(str)
+
             success, msg = save_all_to_excel()
             st.success("Invested! " + msg) if success else st.warning("Invested! " + msg)
-        else:
-            st.warning("Please enter the name of the share or fund.")
 
 
 # TAB 5: MANAGE DATA (CRUD)
