@@ -169,6 +169,8 @@ with st.sidebar:
 
     st.divider()
     for ticker in st.session_state.watchlist:
+        if st.button("Refresh prices", key=f"refresh_{ticker}"):
+            st.rerun()
         with st.container(border=True):
             st.write(f"**{ticker}**")
             data = get_live_stock_data(ticker)
