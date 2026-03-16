@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import datetime
 import os
+import json
+import uuid
 import ollama
 import yfinance as yf
 import re
@@ -10,34 +12,47 @@ import urllib3
 from curl_cffi import requests as curl_requests
 import plotly.express as px
 import plotly.graph_objects as go
+import io
 
-# Configuration
-EXCEL_FILE = "finance_tracker.xlsx"
-LLM_MODEL = "qwen3-coder:latest"
-CUSTOM_CATEGORIES_FILE = "custom_categories.json"
-GOALS_FILE ="goals.json"
+# ── Configuration ──────────────────────────────────────────────────────────────
+EXCEL_FILE            = "finance_tracker.xlsx"
+LLM_MODEL             = "qwen3-coder:latest"
+CUSTOM_CATS_INC_FILE  = "custom_categories_income.json"
+CUSTOM_CATS_EXP_FILE  = "custom_categories_expense.json"
+GOALS_FILE            = "goals.json"
+BUDGETS_FILE          = "budgets.json"
+RECURRING_FILE        = "recurring.json"
+WATCHLIST_FILE        = "watchlist.json"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# --- UTILITIES ---
+# ── JSON helpers ───────────────────────────────────────────────────────────────
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ── Yahoo Finance ──────────────────────────────────────────────────────────────
 def search_ticker(query):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'} 
-    def fetch_results(search_term):
-        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={search_term}"
-        response = requests.get(url, headers=headers, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        results = []
-        for quote in data.get('quotes', [])[:10]:
-            symbol = quote.get('symbol', '')
-            if symbol:
-                results.append(f"{quote.get('shortname', 'Unknown')} ({symbol}) - {quote.get('exchange', 'Unknown')}")
-        return results
+    headers = {"User-Agent": "Mozilla/5.0"}
+    def _fetch(q):
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={q}"
+        r = requests.get(url, headers=headers, verify=False, timeout=8)
+        r.raise_for_status()
+        return [
+            f"{qt.get('shortname','Unknown')} ({qt.get('symbol','')}) - {qt.get('exchange','')}"
+            for qt in r.json().get("quotes", [])[:10]
+            if qt.get("symbol")
+        ]
     try:
-        results = fetch_results(query)
+        results = _fetch(query)
         if not results and " " in query:
-            fallback_query = query.split()[-1] 
-            results = fetch_results(fallback_query)
+            results = _fetch(query.split()[-1])
         return results, None
     except Exception as e:
         return [], str(e)
@@ -48,479 +63,1080 @@ def get_live_stock_data(ticker_symbol):
         session = curl_requests.Session(impersonate="chrome")
         session.verify = False
         ticker = yf.Ticker(ticker_symbol, session=session)
-        todays_data = ticker.history(period='5d')
-        if len(todays_data) < 2:
+        hist = ticker.history(period="5d")
+        if len(hist) < 2:
             return None
-        current_price = todays_data['Close'].iloc[-1]
-        prev_close = todays_data['Close'].iloc[-2]
-        change = current_price - prev_close
-        pct_change = (change / prev_close) * 100
-        return current_price, change, pct_change
-    except Exception as e:
+        cur   = hist["Close"].iloc[-1]
+        prev  = hist["Close"].iloc[-2]
+        chg   = cur - prev
+        pct   = chg / prev * 100
+        return cur, chg, pct
+    except Exception:
         return None
 
-# --- DATA MANAGEMENT ---
-def load_goals():
-    if 'goals' not in st.session_state:
-        if os.path.exists(GOALS_FILE):
-            import json
-            with open(GOALS_FILE, 'r') as f:
-                st.session_state.goals = json.load(f)
+@st.cache_data(ttl=300, show_spinner=False)
+def get_portfolio_current_value(holdings: tuple):
+    """holdings = tuple of (name, ticker, qty, cost) — must be hashable for cache"""
+    results = []
+    for name, ticker, qty, cost in holdings:
+        if not ticker:
+            results.append({"name": name, "ticker": ticker, "qty": qty,
+                             "cost": cost, "current_price": None,
+                             "current_value": None, "gain_loss": None, "pct_return": None})
+            continue
+        data = get_live_stock_data(ticker)
+        if data:
+            cur_price = data[0]
+            cur_val   = cur_price * qty
+            gain      = cur_val - cost
+            pct       = gain / cost * 100 if cost else 0
+            results.append({"name": name, "ticker": ticker, "qty": qty,
+                             "cost": cost, "current_price": cur_price,
+                             "current_value": cur_val, "gain_loss": gain, "pct_return": pct})
         else:
-            # Initialize with an example goal
-            st.session_state.goals = [{
-                "id": "init_1", 
-                "title": "Honda CB500", 
-                "desc": "Motorcycle purchase fund", 
-                "target": 500000.0, 
-                "include_investments": False,
-                "target_date": (datetime.date.today() + datetime.timedelta(days=365)).strftime("%Y-%m-%d")
-            }]
-            save_goals()
+            results.append({"name": name, "ticker": ticker, "qty": qty,
+                             "cost": cost, "current_price": None,
+                             "current_value": None, "gain_loss": None, "pct_return": None})
+    return results
 
-def save_goals():
-    import json
-    with open(GOALS_FILE, 'w') as f:
-        json.dump(st.session_state.goals, f)
-def undo_last_entry(sheet_name):
-    if not st.session_state.data[sheet_name].empty:
-        st.session_state.data[sheet_name] = st.session_state.data[sheet_name].iloc[:-1]
-        save_all_to_excel()
-        st.success(f"Last entry removed from {sheet_name}!")
-        st.rerun()
-def add_new_category(new_cat):
-    if new_cat and new_cat not in st.session_state.custom_categories:
-        st.session_state.custom_categories.append(new_cat)
-        save_custom_categories()
-def load_custom_categories():
-    if 'custom_categories' not in st.session_state:
-        if os.path.exists(CUSTOM_CATEGORIES_FILE):
-            import json
-            with open(CUSTOM_CATEGORIES_FILE, 'r') as f:
-                st.session_state.custom_categories = json.load(f)
-        else:
-            st.session_state.custom_categories = []
-
-def save_custom_categories():
-    import json
-    with open(CUSTOM_CATEGORIES_FILE, 'w') as f:
-        json.dump(st.session_state.custom_categories, f)
-
+# ── Data initialisation ────────────────────────────────────────────────────────
 def init_data():
+    # Excel file
     if not os.path.exists(EXCEL_FILE):
         with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl") as writer:
             pd.DataFrame(columns=["Sr No", "Date", "Salary Credited"]).to_excel(writer, sheet_name="MAIN SALARY", index=False)
             pd.DataFrame(columns=["Sr No", "Date", "Income Type", "Amount", "Notes"]).to_excel(writer, sheet_name="OTHER INCOME", index=False)
             pd.DataFrame(columns=["Sr No", "Date", "Expense Type", "Amount", "Notes"]).to_excel(writer, sheet_name="EXPENSES", index=False)
-            pd.DataFrame(columns=["Sr No", "Date", "Share/Fund Name", "Quantity", "Total Amount Invested"]).to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
-    
-    load_custom_categories()
-    load_goals()
-    
-    if 'data' not in st.session_state:
-        st.session_state.data = {
-            "MAIN SALARY": pd.read_excel(EXCEL_FILE, sheet_name="MAIN SALARY"),
-            "OTHER INCOME": pd.read_excel(EXCEL_FILE, sheet_name="OTHER INCOME"),
-            "EXPENSES": pd.read_excel(EXCEL_FILE, sheet_name="EXPENSES"),
-            "SHARES and FUNDS": pd.read_excel(EXCEL_FILE, sheet_name="SHARES and FUNDS")
-        }
+            pd.DataFrame(columns=["Sr No", "Date", "Share/Fund Name", "Ticker", "Quantity", "Total Amount Invested"]).to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
 
-        for sheet in st.session_state.data:
-            df = st.session_state.data[sheet]
+    # Session-state guards
+    if "custom_inc_cats"  not in st.session_state:
+        st.session_state.custom_inc_cats  = load_json(CUSTOM_CATS_INC_FILE, [])
+    if "custom_exp_cats"  not in st.session_state:
+        st.session_state.custom_exp_cats  = load_json(CUSTOM_CATS_EXP_FILE, [])
+    if "goals"            not in st.session_state:
+        st.session_state.goals            = load_json(GOALS_FILE, _example_goals())
+    if "budgets"          not in st.session_state:
+        st.session_state.budgets          = load_json(BUDGETS_FILE, {})
+    if "recurring"        not in st.session_state:
+        st.session_state.recurring        = load_json(RECURRING_FILE, [])
+    if "watchlist"        not in st.session_state:
+        st.session_state.watchlist        = load_json(WATCHLIST_FILE, ["RELIANCE.NS", "TCS.NS", "AAPL"])
+    if "ai_chat_history"  not in st.session_state:
+        st.session_state.ai_chat_history  = []
+
+    if "data" not in st.session_state:
+        st.session_state.data = {
+            "MAIN SALARY":    pd.read_excel(EXCEL_FILE, sheet_name="MAIN SALARY"),
+            "OTHER INCOME":   pd.read_excel(EXCEL_FILE, sheet_name="OTHER INCOME"),
+            "EXPENSES":       pd.read_excel(EXCEL_FILE, sheet_name="EXPENSES"),
+            "SHARES and FUNDS": pd.read_excel(EXCEL_FILE, sheet_name="SHARES and FUNDS"),
+        }
+        # Ensure Ticker column exists in investments
+        if "Ticker" not in st.session_state.data["SHARES and FUNDS"].columns:
+            st.session_state.data["SHARES and FUNDS"]["Ticker"] = ""
+
+        for sheet, df in st.session_state.data.items():
             if "Date" in df.columns and not df.empty:
-                df["Date"] = pd.to_datetime(df["Date"], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
-                df["Date"] = df["Date"].fillna(datetime.date.today().strftime("%Y-%m-%d"))
+                df["Date"] = (pd.to_datetime(df["Date"], errors="coerce", format="mixed")
+                              .dt.strftime("%Y-%m-%d")
+                              .fillna(datetime.date.today().strftime("%Y-%m-%d")))
                 st.session_state.data[sheet] = df
 
+def _example_goals():
+    return [{
+        "id": "init_1",
+        "title": "Honda CB500",
+        "desc": "Motorcycle purchase fund",
+        "target": 500000.0,
+        "include_investments": False,
+        "target_date": (datetime.date.today() + datetime.timedelta(days=365)).strftime("%Y-%m-%d"),
+    }]
+
+# ── Persistence ────────────────────────────────────────────────────────────────
 def save_all_to_excel():
     try:
         with pd.ExcelWriter(EXCEL_FILE, engine="openpyxl", mode="w") as writer:
             for sheet_name, df in st.session_state.data.items():
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
-        return True, "Data synced to Excel successfully."
+        return True, "Synced to Excel."
     except PermissionError:
-        return False, "Permission Denied: Please close the Excel file."
+        return False, "Permission denied — close the Excel file first."
     except Exception as e:
-        return False, f"Error: {str(e)}"
+        return False, f"Error: {e}"
 
-def get_next_sr_no(df_name):
-    df = st.session_state.data[df_name]
+def save_goals():      save_json(GOALS_FILE, st.session_state.goals)
+def save_budgets():    save_json(BUDGETS_FILE, st.session_state.budgets)
+def save_recurring():  save_json(RECURRING_FILE, st.session_state.recurring)
+def save_watchlist():  save_json(WATCHLIST_FILE, st.session_state.watchlist)
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def get_next_sr_no(sheet):
+    df = st.session_state.data[sheet]
     return 1 if df.empty else int(df["Sr No"].max()) + 1
 
-# --- AI ---
-def get_ai_insights():
-    df_salary = st.session_state.data["MAIN SALARY"]
-    df_other_inc = st.session_state.data["OTHER INCOME"]
-    df_exp = st.session_state.data["EXPENSES"]
-    df_shares = st.session_state.data["SHARES and FUNDS"]
-    
-    total_revenue = df_salary["Salary Credited"].sum() + df_other_inc["Amount"].sum()
+def add_row(sheet, row_dict):
+    st.session_state.data[sheet] = pd.concat(
+        [st.session_state.data[sheet], pd.DataFrame([row_dict])], ignore_index=True
+    )
+    save_all_to_excel()
+
+def undo_last_entry(sheet):
+    if not st.session_state.data[sheet].empty:
+        st.session_state.data[sheet] = st.session_state.data[sheet].iloc[:-1]
+        save_all_to_excel()
+        st.success(f"Last entry removed from {sheet}.")
+        st.rerun()
+
+def add_income_category(cat):
+    if cat and cat not in st.session_state.custom_inc_cats:
+        st.session_state.custom_inc_cats.append(cat)
+        save_json(CUSTOM_CATS_INC_FILE, st.session_state.custom_inc_cats)
+
+def add_expense_category(cat):
+    if cat and cat not in st.session_state.custom_exp_cats:
+        st.session_state.custom_exp_cats.append(cat)
+        save_json(CUSTOM_CATS_EXP_FILE, st.session_state.custom_exp_cats)
+
+def filter_df(df, date_col="Date", period="All Time"):
+    if period == "All Time" or df.empty:
+        return df
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    today = datetime.date.today()
+    if period == "Current Month":
+        return df[(df[date_col].dt.month == today.month) & (df[date_col].dt.year == today.year)]
+    if period == "Last 3 Months":
+        cutoff = today - datetime.timedelta(days=90)
+        return df[df[date_col].dt.date >= cutoff]
+    if period == "Current Year":
+        return df[df[date_col].dt.year == today.year]
+    return df
+
+def budget_status(category):
+    """Returns (spent, limit, pct) or None if no budget set."""
+    limit = st.session_state.budgets.get(category)
+    if not limit:
+        return None
+    today = datetime.date.today()
+    df = st.session_state.data["EXPENSES"].copy()
+    if df.empty:
+        return 0.0, limit, 0.0
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    spent = df[
+        (df["Expense Type"] == category) &
+        (df["Date"].dt.month == today.month) &
+        (df["Date"].dt.year == today.year)
+    ]["Amount"].sum()
+    pct = spent / limit if limit else 0
+    return spent, limit, pct
+
+# ── Recurring transactions ─────────────────────────────────────────────────────
+def generate_recurring_entries():
+    today = datetime.date.today()
+    generated = 0
+    for rec in st.session_state.recurring:
+        if not rec.get("active", True):
+            continue
+        last = datetime.date.fromisoformat(rec["last_generated"]) if rec.get("last_generated") else None
+        freq = rec["frequency"]
+
+        # Determine if due
+        due = False
+        if freq == "Monthly":
+            due = (last is None) or (today.year > last.year or today.month > last.month)
+        elif freq == "Weekly":
+            due = (last is None) or ((today - last).days >= 7)
+        elif freq == "Quarterly":
+            last_q = (last.month - 1) // 3 if last else -1
+            cur_q  = (today.month - 1) // 3
+            due = (last is None) or (today.year > last.year) or (cur_q > last_q)
+
+        if not due:
+            continue
+
+        date_str = today.strftime("%Y-%m-%d")
+        sheet    = rec["sheet"]
+        if sheet == "MAIN SALARY":
+            add_row(sheet, {"Sr No": get_next_sr_no(sheet), "Date": date_str,
+                            "Salary Credited": rec["amount"]})
+        elif sheet == "OTHER INCOME":
+            add_row(sheet, {"Sr No": get_next_sr_no(sheet), "Date": date_str,
+                            "Income Type": rec["label"], "Amount": rec["amount"], "Notes": "Auto-recurring"})
+        elif sheet == "EXPENSES":
+            add_row(sheet, {"Sr No": get_next_sr_no(sheet), "Date": date_str,
+                            "Expense Type": rec["label"], "Amount": rec["amount"], "Notes": "Auto-recurring"})
+
+        rec["last_generated"] = today.isoformat()
+        generated += 1
+
+    if generated:
+        save_recurring()
+    return generated
+
+# ── Bank CSV import ────────────────────────────────────────────────────────────
+def parse_bank_csv(uploaded_file, date_col, amount_col, desc_col, cr_dr_col=None, debit_keyword="DR"):
+    """Flexible CSV importer. Returns (expenses_df, income_df, error)."""
+    try:
+        df = pd.read_csv(uploaded_file)
+        df.columns = df.columns.str.strip()
+        df[date_col]   = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True).dt.strftime("%Y-%m-%d")
+        df[amount_col] = pd.to_numeric(df[amount_col].astype(str).str.replace(",", ""), errors="coerce").fillna(0).abs()
+
+        if cr_dr_col and cr_dr_col in df.columns:
+            debits  = df[df[cr_dr_col].astype(str).str.contains(debit_keyword, case=False)]
+            credits = df[~df[cr_dr_col].astype(str).str.contains(debit_keyword, case=False)]
+        else:
+            debits  = df
+            credits = pd.DataFrame(columns=df.columns)
+
+        expenses = debits[[date_col, desc_col, amount_col]].rename(
+            columns={date_col: "Date", desc_col: "Expense Type", amount_col: "Amount"})
+        expenses["Notes"] = "Imported"
+
+        income = credits[[date_col, desc_col, amount_col]].rename(
+            columns={date_col: "Date", desc_col: "Income Type", amount_col: "Amount"})
+        income["Notes"] = "Imported"
+
+        return expenses, income, None
+    except Exception as e:
+        return None, None, str(e)
+
+# ── AI ─────────────────────────────────────────────────────────────────────────
+def build_financial_context():
+    df_sal  = st.session_state.data["MAIN SALARY"]
+    df_inc  = st.session_state.data["OTHER INCOME"]
+    df_exp  = st.session_state.data["EXPENSES"]
+    df_inv  = st.session_state.data["SHARES and FUNDS"]
+
+    total_income   = df_sal["Salary Credited"].sum() + df_inc["Amount"].sum()
     total_expenses = df_exp["Amount"].sum()
-    total_investments = df_shares["Total Amount Invested"].sum()
-    
-    prompt = f"""You are an expert financial advisor.
-    * **Total Revenue (Salary + Other):** ₹{total_revenue}
-    * **Total Expenses:** ₹{total_expenses}
-    * **Total Investments:** ₹{total_investments}
-    Analyze spending, suggest savings, and advise on investments based on these totals."""
-    
+    total_invested = df_inv["Total Amount Invested"].sum()
+    liquid         = total_income - total_expenses - total_invested
+    savings_rate   = (total_income - total_expenses) / total_income * 100 if total_income else 0
+
+    exp_by_cat = df_exp.groupby("Expense Type")["Amount"].sum().to_dict() if not df_exp.empty else {}
+    inv_by_name = df_inv.groupby("Share/Fund Name")["Total Amount Invested"].sum().to_dict() if not df_inv.empty else {}
+
+    # Monthly trend (last 6 months)
+    monthly = {}
+    if not df_exp.empty:
+        df_tmp = df_exp.copy()
+        df_tmp["Date"] = pd.to_datetime(df_tmp["Date"], errors="coerce")
+        df_tmp["YM"] = df_tmp["Date"].dt.to_period("M").astype(str)
+        monthly = df_tmp.groupby("YM")["Amount"].sum().tail(6).to_dict()
+
+    return f"""
+FINANCIAL SNAPSHOT (all-time):
+- Total income: ₹{total_income:,.0f}  (Salary ₹{df_sal['Salary Credited'].sum():,.0f} + Other ₹{df_inc['Amount'].sum():,.0f})
+- Total expenses: ₹{total_expenses:,.0f}
+- Total invested: ₹{total_invested:,.0f}
+- Liquid balance: ₹{liquid:,.0f}
+- Savings rate: {savings_rate:.1f}%
+- Expense breakdown: {exp_by_cat}
+- Investment portfolio: {inv_by_name}
+- Monthly expense trend (last 6 months): {monthly}
+- Active budgets: {st.session_state.budgets}
+- Goals: {[{'title': g['title'], 'target': g['target'], 'date': g['target_date']} for g in st.session_state.goals]}
+"""
+
+def get_ai_report():
+    ctx = build_financial_context()
+    prompt = f"""Act as a Senior Certified Financial Planner (CFP). Analyse this personal financial data and write a concise, actionable report in Markdown.
+
+{ctx}
+
+Structure your report with these sections:
+1. **Executive Summary** (2 sentences)
+2. **Spending Analysis** — top categories, savings rate assessment
+3. **50/30/20 Rule Check** — compare current split vs ideal
+4. **Optimisation Strategy** — 3 specific tips tied to the actual data
+5. **Investment Critique** — portfolio concentration, diversification
+6. **30-Day Action Plan** — 5 bullet checklist
+
+Be direct, data-driven, and specific. Use ₹ values from the data."""
     try:
         response = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
-        return response['message']['content']
+        return response["message"]["content"]
     except Exception as e:
-        return f"Error connecting to Ollama: {str(e)}"
+        return f"⚠️ Could not connect to Ollama: {e}\n\nMake sure Ollama is running locally with `ollama serve`."
 
-# --- UI ---
-st.set_page_config(page_title="AI Finance Tracker", layout="wide")
+def get_ai_chat_response(user_message):
+    ctx = build_financial_context()
+    system = f"""You are a friendly, expert personal finance advisor. You have access to the user's complete financial data below. 
+Answer questions specifically using their numbers. Be concise but insightful.
+
+{ctx}"""
+    history = [{"role": "system", "content": system}]
+    for msg in st.session_state.ai_chat_history[-10:]:  # keep last 10 for context window
+        history.append({"role": msg["role"], "content": msg["content"]})
+    history.append({"role": "user", "content": user_message})
+
+    try:
+        response = ollama.chat(model=LLM_MODEL, messages=history)
+        return response["message"]["content"]
+    except Exception as e:
+        return f"⚠️ Ollama error: {e}"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# UI
+# ══════════════════════════════════════════════════════════════════════════════
+st.set_page_config(page_title="Finance Tracker", layout="wide", page_icon="₹")
 init_data()
-if 'watchlist' not in st.session_state:
-    st.session_state.watchlist = ["RELIANCE.NS", "TCS.NS", "AAPL"]
 
-st.title("Salary & Expense Tracker")
+# Auto-generate recurring entries once per session
+if "recurring_checked" not in st.session_state:
+    n = generate_recurring_entries()
+    st.session_state.recurring_checked = True
+    if n:
+        st.toast(f"✅ {n} recurring transaction(s) auto-added.", icon="🔄")
 
-tab1, tab_inc, tab2, tab3, tab_goals,tab5, tab6 = st.tabs(["Main Salary", "Other Income", "Expenses", "Shares & Funds", "Goals","Manage Data", "Dashboard & AI"])
-system_date = datetime.date.today().strftime("%Y-%m-%d")
+today_str = datetime.date.today().strftime("%Y-%m-%d")
 
-# Sidebar
+st.title("Finance Tracker")
+
+(tab_salary, tab_income, tab_expenses, tab_invest,
+ tab_goals, tab_budget, tab_recurring, tab_import,
+ tab_manage, tab_dashboard, tab_ai) = st.tabs([
+    "Salary", "Other Income", "Expenses",
+    "Investments", "Goals", "Budgets",
+    "Recurring", "Import", "Manage Data",
+    "Dashboard", "AI Advisor",
+])
+
+# ── SIDEBAR: Watchlist ─────────────────────────────────────────────────────────
 with st.sidebar:
-    st.info("Yahoo Finance Watchlist")
-    search_query = st.text_input("Search Company/Fund")
-    if st.button("Search"):
-        if search_query:
-            results, error_msg = search_ticker(search_query)
-            if not error_msg: st.session_state.search_results = results
+    st.markdown("### Watchlist")
+    query = st.text_input("Search company / fund")
+    if st.button("Search", key="wl_search"):
+        if query:
+            results, err = search_ticker(query)
+            st.session_state.search_results = results
+            if err:
+                st.error(err)
 
-    if 'search_results' in st.session_state and st.session_state.search_results:
-        selected_option = st.selectbox("Select ticker:", st.session_state.search_results)
+    if st.session_state.get("search_results"):
+        sel = st.selectbox("Select:", st.session_state.search_results)
         if st.button("Add to Watchlist"):
-            match = re.search(r'\((.*?)\)', selected_option)
-            if match:
-                st.session_state.watchlist.append(match.group(1))
-                st.rerun()
+            m = re.search(r"\((.*?)\)", sel)
+            if m:
+                sym = m.group(1)
+                if sym not in st.session_state.watchlist:
+                    st.session_state.watchlist.append(sym)
+                    save_watchlist()
+                    st.rerun()
 
     st.divider()
-    for ticker in st.session_state.watchlist:
-        if st.button("Refresh prices", key=f"refresh_{ticker}"):
-            st.rerun()
+    for ticker in list(st.session_state.watchlist):
         with st.container(border=True):
-            st.write(f"**{ticker}**")
+            c1, c2 = st.columns([3, 1])
+            c1.write(f"**{ticker}**")
+            if c2.button("✕", key=f"rm_{ticker}"):
+                st.session_state.watchlist.remove(ticker)
+                save_watchlist()
+                st.rerun()
             data = get_live_stock_data(ticker)
             if data:
-                current_price, change, pct_change = data
-                st.metric(label="Price", value=f"{current_price:.2f}", delta=f"{change:.2f} ({pct_change:.2f}%)")
-            if st.button("Remove", key=f"rm_{ticker}"):
-                st.session_state.watchlist.remove(ticker)
-                st.rerun()
+                price, chg, pct = data
+                st.metric("Price", f"{price:.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
+            else:
+                st.caption("Unable to fetch price")
 
-# TAB 1: SALARY
-with tab1:
+# ── TAB: SALARY ────────────────────────────────────────────────────────────────
+with tab_salary:
     st.subheader("Credit Salary")
-    salary_amount = st.number_input("Amount", min_value=0.0, step=100.0)
-    if st.button("Add Salary"):
-        new_row = {"Sr No": get_next_sr_no("MAIN SALARY"), "Date": system_date, "Salary Credited": salary_amount}
-        st.session_state.data["MAIN SALARY"] = pd.concat([st.session_state.data["MAIN SALARY"], pd.DataFrame([new_row])], ignore_index=True)
-        save_all_to_excel()
-        st.success("Added!")
+    col1, col2 = st.columns(2)
+    sal_amt  = col1.number_input("Amount (₹)", min_value=0.0, step=100.0, key="sal_amt")
+    sal_date = col2.date_input("Date", value=datetime.date.today(), key="sal_dt").strftime("%Y-%m-%d")
+    if st.button("Add Salary Entry"):
+        add_row("MAIN SALARY", {"Sr No": get_next_sr_no("MAIN SALARY"),
+                                 "Date": sal_date, "Salary Credited": sal_amt})
+        st.success(f"Salary ₹{sal_amt:,.0f} credited!")
+        st.rerun()
 
-# TAB: OTHER INCOME
-with tab_inc:
+    if not st.session_state.data["MAIN SALARY"].empty:
+        if st.button("↩ Undo Last", key="undo_sal"):
+            undo_last_entry("MAIN SALARY")
+        st.dataframe(st.session_state.data["MAIN SALARY"].tail(10), use_container_width=True)
+
+# ── TAB: OTHER INCOME ──────────────────────────────────────────────────────────
+with tab_income:
     st.subheader("Log Other Income")
-    inc_date = st.date_input("Date", value=datetime.date.today(), key="inc_dt").strftime("%Y-%m-%d")
-    
-    # Combine default income types with your saved custom categories
-    base_inc_cats = ["Bonus", "Freelance", "Dividends", "Gift"]
-    inc_cats = sorted(list(set(base_inc_cats + st.session_state.custom_categories))) + ["Custom..."]
-    
-    inc_type = st.selectbox("Type", inc_cats, key="inc_tp")
-    custom_inc_name = ""
-    if inc_type == "Custom...":
-        custom_inc_name = st.text_input("Category Name", key="custom_inc_input")
+    c1, c2 = st.columns(2)
+    inc_date = c1.date_input("Date", value=datetime.date.today(), key="inc_dt").strftime("%Y-%m-%d")
 
-    inc_amt = st.number_input("Amount", min_value=0.0, step=10.0, key="inc_val")
-    inc_notes = st.text_area("Notes", key="inc_nt")
+    base_inc = ["Bonus", "Freelance", "Dividends", "Gift", "Rental", "Interest"]
+    all_inc  = sorted(set(base_inc + st.session_state.custom_inc_cats)) + ["Custom…"]
+    inc_type = c2.selectbox("Income Type", all_inc, key="inc_tp")
+
+    custom_inc = ""
+    if inc_type == "Custom…":
+        custom_inc = st.text_input("New category name", key="custom_inc")
+
+    c3, c4 = st.columns(2)
+    inc_amt   = c3.number_input("Amount (₹)", min_value=0.0, step=10.0, key="inc_amt")
+    inc_notes = c4.text_input("Notes (optional)", key="inc_notes")
 
     if st.button("Add Income"):
-        final_type = custom_inc_name if inc_type == "Custom..." else inc_type
-        if inc_type == "Custom..." and custom_inc_name:
-            add_new_category(custom_inc_name)
-        
-        new_row = {"Sr No": get_next_sr_no("OTHER INCOME"), "Date": inc_date, "Income Type": final_type, "Amount": inc_amt, "Notes": inc_notes}
-        st.session_state.data["OTHER INCOME"] = pd.concat([st.session_state.data["OTHER INCOME"], pd.DataFrame([new_row])], ignore_index=True)
-        save_all_to_excel()
-        st.success(f"Income logged under {final_type}!")
+        final = custom_inc if inc_type == "Custom…" else inc_type
+        if inc_type == "Custom…" and custom_inc:
+            add_income_category(custom_inc)
+        add_row("OTHER INCOME", {"Sr No": get_next_sr_no("OTHER INCOME"),
+                                  "Date": inc_date, "Income Type": final,
+                                  "Amount": inc_amt, "Notes": inc_notes})
+        st.success(f"Income ₹{inc_amt:,.0f} logged under {final}!")
         st.rerun()
 
-# TAB 2: EXPENSES
-with tab2:
+    if not st.session_state.data["OTHER INCOME"].empty:
+        if st.button("↩ Undo Last", key="undo_inc"):
+            undo_last_entry("OTHER INCOME")
+        st.dataframe(st.session_state.data["OTHER INCOME"].tail(10), use_container_width=True)
+
+# ── TAB: EXPENSES ──────────────────────────────────────────────────────────────
+with tab_expenses:
     st.subheader("Log Expense")
-    exp_date = st.date_input("Date", value=datetime.date.today(), key="exp_dt").strftime("%Y-%m-%d")
-    
-    # Combine default expense types with your saved custom categories
-    base_exp_cats = ["Rent", "Groceries", "Utilities", "Transport", "Entertainment"]
-    exp_cats = sorted(list(set(base_exp_cats + st.session_state.custom_categories))) + ["Custom..."]
-    
-    exp_type = st.selectbox("Type", exp_cats, key="exp_select")
-    custom_exp_name = ""
-    if exp_type == "Custom...":
-        custom_exp_name = st.text_input("New Category", key="custom_exp_input")
-        
-    exp_amt = st.number_input("Amount", min_value=0.0, step=10.0, key="exp_amt_input")
-    exp_notes = st.text_area("Notes", key="exp_notes_input")
+    c1, c2 = st.columns(2)
+    exp_date = c1.date_input("Date", value=datetime.date.today(), key="exp_dt").strftime("%Y-%m-%d")
+
+    base_exp = ["Rent", "Groceries", "Utilities", "Transport", "Entertainment",
+                "Healthcare", "Dining Out", "Shopping", "Education", "Subscriptions"]
+    all_exp  = sorted(set(base_exp + st.session_state.custom_exp_cats)) + ["Custom…"]
+    exp_type = c2.selectbox("Expense Type", all_exp, key="exp_tp")
+
+    custom_exp = ""
+    if exp_type == "Custom…":
+        custom_exp = st.text_input("New category name", key="custom_exp")
+
+    c3, c4 = st.columns(2)
+    exp_amt   = c3.number_input("Amount (₹)", min_value=0.0, step=10.0, key="exp_amt")
+    exp_notes = c4.text_input("Notes (optional)", key="exp_notes")
 
     if st.button("Add Expense"):
-        final_type = custom_exp_name if exp_type == "Custom..." else exp_type
-        if exp_type == "Custom..." and custom_exp_name:
-            add_new_category(custom_exp_name)
-            
-        new_row = {"Sr No": get_next_sr_no("EXPENSES"), "Date": exp_date, "Expense Type": final_type, "Amount": exp_amt, "Notes": exp_notes}
-        st.session_state.data["EXPENSES"] = pd.concat([st.session_state.data["EXPENSES"], pd.DataFrame([new_row])], ignore_index=True)
-        save_all_to_excel()
-        st.success(f"Expense logged under {final_type}!")
+        final = custom_exp if exp_type == "Custom…" else exp_type
+        if exp_type == "Custom…" and custom_exp:
+            add_expense_category(custom_exp)
+        add_row("EXPENSES", {"Sr No": get_next_sr_no("EXPENSES"),
+                              "Date": exp_date, "Expense Type": final,
+                              "Amount": exp_amt, "Notes": exp_notes})
+
+        # Budget alert
+        status = budget_status(final)
+        if status:
+            spent, limit, pct = status
+            if pct >= 1.0:
+                st.error(f"🚨 Budget EXCEEDED for {final}! Spent ₹{spent:,.0f} / ₹{limit:,.0f}")
+            elif pct >= 0.8:
+                st.warning(f"⚠️ {final} budget at {pct*100:.0f}% — ₹{limit-spent:,.0f} remaining")
+            else:
+                st.success(f"Expense logged. {final}: ₹{spent:,.0f} / ₹{limit:,.0f} ({pct*100:.0f}%)")
+        else:
+            st.success(f"Expense ₹{exp_amt:,.0f} logged under {final}!")
         st.rerun()
-    # Add to bottom of EXPENSES tab
+
+    # Budget mini-dashboard
+    if st.session_state.budgets:
+        st.markdown("#### This Month's Budget Status")
+        for cat, limit in st.session_state.budgets.items():
+            s = budget_status(cat)
+            if s:
+                spent, lim, pct = s
+                color = "🔴" if pct >= 1 else ("🟡" if pct >= 0.8 else "🟢")
+                st.markdown(f"{color} **{cat}** — ₹{spent:,.0f} / ₹{lim:,.0f}")
+                st.progress(min(pct, 1.0))
+
     if not st.session_state.data["EXPENSES"].empty:
-        if st.button("↩️ Undo Last Expense", key="undo_exp"):
+        if st.button("↩ Undo Last", key="undo_exp"):
             undo_last_entry("EXPENSES")
+        st.dataframe(st.session_state.data["EXPENSES"].tail(10), use_container_width=True)
 
-# TAB 3: INVESTMENTS
-with tab3:
+# ── TAB: INVESTMENTS ───────────────────────────────────────────────────────────
+with tab_invest:
     st.subheader("Log Investment")
-    inv_name = st.text_input("Share/Fund Name")
-    inv_qty = st.number_input("Quantity", min_value=0.0, step=1.0)
-    inv_amt = st.number_input("Total Invested", min_value=0.0, step=50.0)
+    c1, c2, c3 = st.columns(3)
+    inv_name = c1.text_input("Share / Fund Name", key="inv_name")
+    inv_tick = c2.text_input("Ticker (optional, for live P&L)", placeholder="e.g. TCS.NS", key="inv_tick")
+    inv_qty  = c3.number_input("Quantity", min_value=0.0, step=1.0, key="inv_qty")
+ 
+    c4, c5 = st.columns(2)
+    inv_amt  = c4.number_input("Total Invested (₹)", min_value=0.0, step=50.0, key="inv_amt")
+    inv_date = c5.date_input("Date", value=datetime.date.today(), key="inv_dt").strftime("%Y-%m-%d")
+ 
     if st.button("Add Investment"):
-        new_row = {"Sr No": get_next_sr_no("SHARES and FUNDS"), "Date": system_date, "Share/Fund Name": inv_name, "Quantity": inv_qty, "Total Amount Invested": inv_amt}
-        st.session_state.data["SHARES and FUNDS"] = pd.concat([st.session_state.data["SHARES and FUNDS"], pd.DataFrame([new_row])], ignore_index=True)
+        add_row("SHARES and FUNDS", {
+            "Sr No": get_next_sr_no("SHARES and FUNDS"),
+            "Date": inv_date, "Share/Fund Name": inv_name,
+            "Ticker": inv_tick, "Quantity": inv_qty,
+            "Total Amount Invested": inv_amt,
+        })
+        st.success(f"Investment in {inv_name} logged!")
+        st.rerun()
+ 
+    if not st.session_state.data["SHARES and FUNDS"].empty:
+        if st.button("↩ Undo Last", key="undo_inv"):
+            undo_last_entry("SHARES and FUNDS")
+ 
+    # Live P&L
+    st.markdown("---")
+    st.subheader("Portfolio P&L")
+ 
+    # Ensure Ticker column exists for old Excel files
+    if "Ticker" not in st.session_state.data["SHARES and FUNDS"].columns:
+        st.session_state.data["SHARES and FUNDS"]["Ticker"] = ""
         save_all_to_excel()
-        st.success("Investment added!")
+ 
+    df_inv_raw = st.session_state.data["SHARES and FUNDS"]
+ 
+    if df_inv_raw.empty:
+        st.info("No investments logged yet.")
+    else:
+        df_inv_pl = df_inv_raw.copy()
+        df_inv_pl["Ticker"] = df_inv_pl["Ticker"].fillna("").astype(str).str.strip()
+ 
+        # Aggregate by Name + Ticker
+        grp = df_inv_pl.groupby(["Share/Fund Name", "Ticker"], as_index=False).agg(
+            Quantity=("Quantity", "sum"),
+            Cost=("Total Amount Invested", "sum"),
+        )
+ 
+        col_refresh, col_note = st.columns([1, 3])
+        if col_refresh.button("🔄 Refresh Live Prices"):
+            st.cache_data.clear()
+            st.rerun()
+        col_note.caption("Tickers without a symbol show cost only. Add a ticker (e.g. TCS.NS, AAPL) when logging to enable live prices.")
+ 
+        rows = []
+        fetch_errors = []
+ 
+        for _, row in grp.iterrows():
+            name    = row["Share/Fund Name"]
+            ticker  = row["Ticker"]
+            qty     = float(row["Quantity"])
+            cost    = float(row["Cost"])
+            cur_price = None
+ 
+            if ticker:
+                try:
+                    session = curl_requests.Session(impersonate="chrome")
+                    session.verify = False
+                    yf_ticker = yf.Ticker(ticker, session=session)
+                    hist = yf_ticker.history(period="5d")
+                    if not hist.empty:
+                        cur_price = float(hist["Close"].iloc[-1])
+                except Exception as e:
+                    fetch_errors.append(f"{ticker}: {e}")
+ 
+            if cur_price is not None:
+                cur_val  = cur_price * qty
+                gain     = cur_val - cost
+                pct_ret  = (gain / cost * 100) if cost else 0.0
+                rows.append({
+                    "Name":        name,
+                    "Ticker":      ticker or "—",
+                    "Qty":         qty,
+                    "Cost (₹)":    cost,
+                    "Price":       cur_price,
+                    "Value (₹)":   cur_val,
+                    "Gain/Loss":   gain,
+                    "Return %":    pct_ret,
+                })
+            else:
+                rows.append({
+                    "Name":        name,
+                    "Ticker":      ticker if ticker else "No ticker",
+                    "Qty":         qty,
+                    "Cost (₹)":    cost,
+                    "Price":       None,
+                    "Value (₹)":   None,
+                    "Gain/Loss":   None,
+                    "Return %":    None,
+                })
+ 
+        if rows:
+            display_df = pd.DataFrame(rows)
+ 
+            # Format for display
+            def fmt_row(r):
+                return {
+                    "Name":       r["Name"],
+                    "Ticker":     r["Ticker"],
+                    "Qty":        r["Qty"],
+                    "Cost (₹)":   f"₹{r['Cost (₹)']:,.0f}",
+                    "Cur. Price": f"₹{r['Price']:,.2f}"   if r["Price"]      is not None else "—",
+                    "Value (₹)":  f"₹{r['Value (₹)']:,.0f}" if r["Value (₹)"] is not None else "—",
+                    "Gain/Loss":  f"₹{r['Gain/Loss']:+,.0f}" if r["Gain/Loss"] is not None else "—",
+                    "Return %":   f"{r['Return %']:+.1f}%"  if r["Return %"]  is not None else "—",
+                }
+ 
+            st.dataframe(
+                pd.DataFrame([fmt_row(r) for r in rows]),
+                use_container_width=True,
+                hide_index=True,
+            )
+ 
+            # Summary metrics for tracked holdings only
+            tracked = [r for r in rows if r["Value (₹)"] is not None]
+            if tracked:
+                total_cost    = sum(r["Cost (₹)"]  for r in tracked)
+                total_current = sum(r["Value (₹)"] for r in tracked)
+                total_gain    = total_current - total_cost
+                pct_overall   = (total_gain / total_cost * 100) if total_cost else 0.0
+ 
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total Cost",     f"₹{total_cost:,.0f}")
+                m2.metric("Current Value",  f"₹{total_current:,.0f}")
+                m3.metric("Unrealised P&L", f"₹{total_gain:+,.0f}",
+                          delta=f"{pct_overall:+.1f}%",
+                          delta_color="normal")
+                m4.metric("Holdings tracked", f"{len(tracked)} / {len(rows)}")
+            else:
+                st.info("No tickers added yet — prices can't be fetched. Edit your holdings and add ticker symbols.")
+ 
+        if fetch_errors:
+            with st.expander(f"⚠️ {len(fetch_errors)} fetch error(s)"):
+                for e in fetch_errors:
+                    st.caption(e)
 
-# TAB 4: GOALS
+# ── TAB: GOALS ─────────────────────────────────────────────────────────────────
 with tab_goals:
-    st.subheader("Financial Goals Tracker")
+    st.subheader("Financial Goals")
 
-    global_income = st.session_state.data["MAIN SALARY"]["Salary Credited"].sum() + st.session_state.data["OTHER INCOME"]["Amount"].sum()
-    global_exp = st.session_state.data["EXPENSES"]["Amount"].sum()
-    global_inv = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
-    
-    total_liquid = (global_income - global_exp) - global_inv
-    total_wealth = global_income - global_exp 
+    total_income_all = (st.session_state.data["MAIN SALARY"]["Salary Credited"].sum() +
+                        st.session_state.data["OTHER INCOME"]["Amount"].sum())
+    total_exp_all    = st.session_state.data["EXPENSES"]["Amount"].sum()
+    total_inv_all    = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
+    liquid_all       = max(0, total_income_all - total_exp_all - total_inv_all)
+    networth_all     = max(0, total_income_all - total_exp_all)
 
-    # --- CREATE ---
     with st.expander("➕ Create New Goal"):
         with st.form("new_goal_form"):
-            new_title = st.text_input("Goal Title")
-            new_desc = st.text_input("Description")
-            
-            col_t1, col_t2 = st.columns(2)
-            new_target = col_t1.number_input("Target Amount (₹)", min_value=1.0, step=1000.0)
-            new_date = col_t2.date_input("Target Date", min_value=datetime.date.today())
-            
-            include_inv = st.checkbox("Include Investments in Progress?")
-            
+            g_title = st.text_input("Goal Title")
+            g_desc  = st.text_input("Description")
+            c1, c2  = st.columns(2)
+            g_target = c1.number_input("Target Amount (₹)", min_value=1.0, step=1000.0)
+            g_date   = c2.date_input("Target Date", min_value=datetime.date.today())
+            g_inv    = st.checkbox("Include investments in progress?")
             if st.form_submit_button("Save Goal"):
-                import uuid
-                new_goal = {
-                    "id": str(uuid.uuid4()),
-                    "title": new_title,
-                    "desc": new_desc,
-                    "target": new_target,
-                    "include_investments": include_inv,
-                    "target_date": new_date.strftime("%Y-%m-%d")
-                }
-                st.session_state.goals.append(new_goal)
+                st.session_state.goals.append({
+                    "id": str(uuid.uuid4()), "title": g_title, "desc": g_desc,
+                    "target": g_target, "include_investments": g_inv,
+                    "target_date": g_date.strftime("%Y-%m-%d"),
+                })
                 save_goals()
-                st.success("Goal Added!")
+                st.success("Goal saved!")
                 st.rerun()
 
     st.divider()
-
-    # --- READ, UPDATE, DELETE ---
-    if not st.session_state.goals:
-        st.info("No active goals. Create one above!")
-    
     today = datetime.date.today()
-    
+    if not st.session_state.goals:
+        st.info("No goals yet. Create one above!")
+
     for i, goal in enumerate(st.session_state.goals):
         with st.container(border=True):
-            col_info, col_actions = st.columns([3, 1])
-            
+            col_info, col_act = st.columns([3, 1])
             with col_info:
                 st.markdown(f"### {goal['title']}")
-                if goal['desc']: st.caption(f"{goal['desc']}")
-                
-                # Progress Math
-                current_funds = total_wealth if goal.get("include_investments", False) else total_liquid
-                current_funds = max(0, current_funds)
-                progress_val = min(current_funds / goal['target'], 1.0) if goal['target'] > 0 else 0.0
-                st.progress(progress_val)
-                
-                # Date & Monthly Savings Math
-                target_dt = datetime.datetime.strptime(goal.get('target_date', (today + datetime.timedelta(days=365)).strftime("%Y-%m-%d")), "%Y-%m-%d").date()
-                months_remaining = (target_dt.year - today.year) * 12 + target_dt.month - today.month
-                months_remaining = max(1, months_remaining) # Prevent division by zero
-                
-                remaining_amt = max(0, goal['target'] - current_funds)
-                monthly_req = remaining_amt / months_remaining
-                
-                st.metric(label=f"Progress ({'Net Worth' if goal.get('include_investments', False) else 'Liquid Cash'})", 
-                          value=f"₹{current_funds:,.2f} / ₹{goal['target']:,.2f}", 
-                          delta=f"{(progress_val*100):.1f}% Funded",
-                          delta_color="normal" if progress_val < 1.0 else "off")
-                
-                if progress_val >= 1.0:
-                    st.success("🎉 Target Reached!")
-                else:
-                    st.info(f"📅 Target: **{target_dt.strftime('%b %Y')}** ({months_remaining} months left) | 💡 Required: **₹{monthly_req:,.2f} / month**")
+                if goal.get("desc"): st.caption(goal["desc"])
 
-            with col_actions:
-                with st.expander("Edit"):
-                    edit_title = st.text_input("Title", value=goal['title'], key=f"title_{i}_{goal['id']}")
-                    edit_desc = st.text_input("Desc", value=goal['desc'], key=f"desc_{i}_{goal['id']}")
-                    edit_target = st.number_input("Target", value=float(goal['target']), step=1000.0, key=f"target_{i}_{goal['id']}")
-                    
-                    fallback_dt = datetime.datetime.strptime(goal.get('target_date', today.strftime("%Y-%m-%d")), "%Y-%m-%d").date()
-                    edit_date = st.date_input("Date", value=fallback_dt, key=f"date_{i}_{goal['id']}")
-                    
-                    edit_inc_inv = st.checkbox("Include Inv.", value=goal.get('include_investments', False), key=f"inc_{i}_{goal['id']}")
-                    
-                    c_save, c_del = st.columns(2)
-                    if c_save.button("Save", key=f"save_{i}_{goal['id']}"):
+                funds     = networth_all if goal.get("include_investments") else liquid_all
+                funds     = max(0, funds)
+                progress  = min(funds / goal["target"], 1.0) if goal["target"] > 0 else 0.0
+                st.progress(progress)
+
+                target_dt = datetime.datetime.strptime(
+                    goal.get("target_date", (today + datetime.timedelta(days=365)).strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+                months_left = max(1, (target_dt.year - today.year) * 12 + target_dt.month - today.month)
+                remaining   = max(0, goal["target"] - funds)
+                monthly_req = remaining / months_left
+
+                st.metric(
+                    label=f"Progress ({'Net Worth' if goal.get('include_investments') else 'Liquid'})",
+                    value=f"₹{funds:,.0f} / ₹{goal['target']:,.0f}",
+                    delta=f"{progress*100:.1f}% funded",
+                    delta_color="normal" if progress < 1.0 else "off",
+                )
+                if progress >= 1.0:
+                    st.success("🎉 Goal reached!")
+                else:
+                    st.info(f"📅 **{target_dt.strftime('%b %Y')}** · {months_left} months · ₹{monthly_req:,.0f}/month needed")
+
+            with col_act:
+                with st.expander("Edit / Delete"):
+                    e_title  = st.text_input("Title",  value=goal["title"],  key=f"et_{i}")
+                    e_desc   = st.text_input("Desc",   value=goal["desc"],   key=f"ed_{i}")
+                    e_target = st.number_input("Target", value=float(goal["target"]), step=1000.0, key=f"eg_{i}")
+                    e_date   = st.date_input("Date",
+                                  value=datetime.datetime.strptime(goal.get("target_date", today.strftime("%Y-%m-%d")), "%Y-%m-%d").date(),
+                                  key=f"edt_{i}")
+                    e_inv    = st.checkbox("Include inv.", value=goal.get("include_investments", False), key=f"ei_{i}")
+                    cs, cd   = st.columns(2)
+                    if cs.button("Save", key=f"gs_{i}"):
                         st.session_state.goals[i].update({
-                            "title": edit_title, "desc": edit_desc, 
-                            "target": edit_target, "include_investments": edit_inc_inv,
-                            "target_date": edit_date.strftime("%Y-%m-%d")
+                            "title": e_title, "desc": e_desc, "target": e_target,
+                            "include_investments": e_inv,
+                            "target_date": e_date.strftime("%Y-%m-%d"),
                         })
                         save_goals()
                         st.rerun()
-                        
-                    if c_del.button("Del", type="primary", key=f"del_{i}_{goal['id']}"):
+                    if cd.button("Delete", type="primary", key=f"gd_{i}"):
                         st.session_state.goals.pop(i)
                         save_goals()
                         st.rerun()
 
-# TAB 5: MANAGE
-with tab5:
-    sheet_choice = st.selectbox("Edit Sheet", ["MAIN SALARY", "OTHER INCOME", "EXPENSES", "SHARES and FUNDS"])
-    edited_df = st.data_editor(st.session_state.data[sheet_choice], num_rows="dynamic", width="stretch")
-    if st.button("Save Changes"):
-        st.session_state.data[sheet_choice] = edited_df
-        success, msg = save_all_to_excel()
-        st.success(msg) if success else st.error(msg)
+# ── TAB: BUDGETS ───────────────────────────────────────────────────────────────
+with tab_budget:
+    st.subheader("Monthly Budget Limits")
+    st.caption("Set a spending ceiling per category. You'll be alerted when you approach or exceed it.")
 
-with tab6:
+    all_cats = sorted(set(
+        ["Rent", "Groceries", "Utilities", "Transport", "Entertainment",
+         "Healthcare", "Dining Out", "Shopping", "Education", "Subscriptions"]
+        + st.session_state.custom_exp_cats
+    ))
+
+    with st.form("budget_form"):
+        st.markdown("**Set / update budget limits (₹/month)**")
+        new_budgets = {}
+        cols = st.columns(2)
+        for idx, cat in enumerate(all_cats):
+            current = st.session_state.budgets.get(cat, 0.0)
+            val = cols[idx % 2].number_input(cat, min_value=0.0, value=float(current), step=500.0, key=f"bgt_{cat}")
+            if val > 0:
+                new_budgets[cat] = val
+        if st.form_submit_button("💾 Save Budgets"):
+            st.session_state.budgets = new_budgets
+            save_budgets()
+            st.success("Budgets saved!")
+            st.rerun()
+
+    st.divider()
+    st.subheader("This Month's Overview")
+    today = datetime.date.today()
+    if st.session_state.budgets:
+        for cat, limit in st.session_state.budgets.items():
+            s = budget_status(cat)
+            if s:
+                spent, lim, pct = s
+                remaining = lim - spent
+                color = "🔴" if pct >= 1 else ("🟡" if pct >= 0.8 else "🟢")
+                c1, c2 = st.columns([3, 1])
+                c1.markdown(f"{color} **{cat}**")
+                c1.progress(min(pct, 1.0))
+                c2.metric("Spent / Limit", f"₹{spent:,.0f}", f"₹{remaining:,.0f} left",
+                          delta_color="inverse")
+    else:
+        st.info("No budgets set yet.")
+
+# ── TAB: RECURRING ─────────────────────────────────────────────────────────────
+with tab_recurring:
+    st.subheader("Recurring Transactions")
+    st.caption("These are auto-added when the app starts if the period has elapsed.")
+
+    with st.expander("➕ Add Recurring Entry"):
+        with st.form("rec_form"):
+            r_label = st.text_input("Label (e.g. Rent, Netflix)")
+            c1, c2  = st.columns(2)
+            r_sheet = c1.selectbox("Type", ["EXPENSES", "OTHER INCOME", "MAIN SALARY"])
+            r_freq  = c2.selectbox("Frequency", ["Monthly", "Weekly", "Quarterly"])
+            r_amt   = st.number_input("Amount (₹)", min_value=0.0, step=100.0)
+            if st.form_submit_button("Add"):
+                st.session_state.recurring.append({
+                    "id": str(uuid.uuid4()), "label": r_label, "sheet": r_sheet,
+                    "frequency": r_freq, "amount": r_amt,
+                    "active": True, "last_generated": None,
+                })
+                save_recurring()
+                st.success(f"Recurring entry '{r_label}' added!")
+                st.rerun()
+
+    st.divider()
+    if not st.session_state.recurring:
+        st.info("No recurring entries yet.")
+    else:
+        for i, rec in enumerate(st.session_state.recurring):
+            with st.container(border=True):
+                c1, c2, c3, c4 = st.columns([3, 2, 2, 1])
+                c1.markdown(f"**{rec['label']}** — {rec['sheet']}")
+                c2.write(f"₹{rec['amount']:,.0f} / {rec['frequency']}")
+                c3.write(f"Last: {rec.get('last_generated') or 'Never'}")
+                active = c4.toggle("Active", value=rec.get("active", True), key=f"rec_active_{i}")
+                if active != rec.get("active", True):
+                    st.session_state.recurring[i]["active"] = active
+                    save_recurring()
+                    st.rerun()
+                if c4.button("Delete", key=f"rec_del_{i}"):
+                    st.session_state.recurring.pop(i)
+                    save_recurring()
+                    st.rerun()
+
+        if st.button("▶ Generate Now (force run)"):
+            st.session_state.pop("recurring_checked", None)
+            for rec in st.session_state.recurring:
+                rec["last_generated"] = None
+            save_recurring()
+            st.rerun()
+
+# ── TAB: IMPORT ────────────────────────────────────────────────────────────────
+with tab_import:
+    st.subheader("Import Bank Statement (CSV)")
+    st.caption("Upload a CSV export from your bank. Map the columns and import in bulk.")
+
+    uploaded = st.file_uploader("Upload CSV", type=["csv"])
+    if uploaded:
+        preview_df = pd.read_csv(uploaded)
+        st.dataframe(preview_df.head(5), use_container_width=True)
+        uploaded.seek(0)
+
+        cols = list(preview_df.columns)
+        c1, c2, c3 = st.columns(3)
+        date_col   = c1.selectbox("Date column",   cols, key="imp_date")
+        amount_col = c2.selectbox("Amount column", cols, key="imp_amt")
+        desc_col   = c3.selectbox("Description",   cols, key="imp_desc")
+
+        cr_dr_col = st.selectbox("Credit/Debit indicator column (optional)", ["None"] + cols)
+        cr_dr_col = None if cr_dr_col == "None" else cr_dr_col
+        debit_kw  = st.text_input("Debit keyword in that column", value="DR")
+
+        if st.button("🔍 Preview Import"):
+            uploaded.seek(0)
+            exp_df, inc_df, err = parse_bank_csv(uploaded, date_col, amount_col, desc_col, cr_dr_col, debit_kw)
+            if err:
+                st.error(f"Parse error: {err}")
+            else:
+                st.markdown(f"**{len(exp_df)} expense rows · {len(inc_df)} income rows detected**")
+                st.markdown("##### Expenses preview")
+                st.dataframe(exp_df.head(10), use_container_width=True)
+                if not inc_df.empty:
+                    st.markdown("##### Income preview")
+                    st.dataframe(inc_df.head(10), use_container_width=True)
+                st.session_state["import_exp"] = exp_df
+                st.session_state["import_inc"] = inc_df
+
+        if "import_exp" in st.session_state:
+            if st.button("✅ Confirm Import"):
+                exp_df = st.session_state["import_exp"]
+                inc_df = st.session_state["import_inc"]
+                for _, row in exp_df.iterrows():
+                    add_row("EXPENSES", {
+                        "Sr No": get_next_sr_no("EXPENSES"),
+                        "Date": row["Date"], "Expense Type": row["Expense Type"],
+                        "Amount": row["Amount"], "Notes": row.get("Notes", "Imported"),
+                    })
+                for _, row in inc_df.iterrows():
+                    add_row("OTHER INCOME", {
+                        "Sr No": get_next_sr_no("OTHER INCOME"),
+                        "Date": row["Date"], "Income Type": row["Income Type"],
+                        "Amount": row["Amount"], "Notes": row.get("Notes", "Imported"),
+                    })
+                st.session_state.pop("import_exp", None)
+                st.session_state.pop("import_inc", None)
+                st.success(f"Imported {len(exp_df)} expenses and {len(inc_df)} income entries!")
+                st.rerun()
+
+# ── TAB: MANAGE DATA ──────────────────────────────────────────────────────────
+with tab_manage:
+    st.subheader("Edit Raw Data")
+    sheet_choice = st.selectbox("Sheet", ["MAIN SALARY", "OTHER INCOME", "EXPENSES", "SHARES and FUNDS"])
+    edited = st.data_editor(st.session_state.data[sheet_choice], num_rows="dynamic", use_container_width=True)
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Save Changes"):
+        st.session_state.data[sheet_choice] = edited
+        ok, msg = save_all_to_excel()
+        st.success(msg) if ok else st.error(msg)
+
+    # Export
+    st.divider()
+    st.subheader("Export")
+    col_a, col_b = st.columns(2)
+    # CSV export
+    csv_buf = io.StringIO()
+    st.session_state.data[sheet_choice].to_csv(csv_buf, index=False)
+    col_a.download_button(
+        "⬇ Download CSV",
+        data=csv_buf.getvalue(),
+        file_name=f"{sheet_choice.lower().replace(' ','_')}.csv",
+        mime="text/csv",
+    )
+    # Full Excel export
+    excel_buf = io.BytesIO()
+    with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
+        for sn, df in st.session_state.data.items():
+            df.to_excel(writer, sheet_name=sn, index=False)
+    col_b.download_button(
+        "⬇ Download Full Excel",
+        data=excel_buf.getvalue(),
+        file_name="finance_tracker_export.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# ── TAB: DASHBOARD ─────────────────────────────────────────────────────────────
+with tab_dashboard:
     st.subheader("Financial Overview")
-    
-    # --- TIME FILTER ---
-    filter_option = st.radio("Timeframe", ["All Time", "Current Month"], horizontal=True)
-    
-    def filter_df(df, date_col="Date"):
-        if filter_option == "All Time" or df.empty: return df
-        df[date_col] = pd.to_datetime(df[date_col])
-        current_month = datetime.date.today().month
-        current_year = datetime.date.today().year
-        return df[(df[date_col].dt.month == current_month) & (df[date_col].dt.year == current_year)]
 
-    df_salary = filter_df(st.session_state.data["MAIN SALARY"].copy())
-    df_other = filter_df(st.session_state.data["OTHER INCOME"].copy())
-    df_exp = filter_df(st.session_state.data["EXPENSES"].copy())
-    df_inv = filter_df(st.session_state.data["SHARES and FUNDS"].copy())
+    period = st.radio("Timeframe", ["All Time", "Current Month", "Last 3 Months", "Current Year"], horizontal=True)
 
-    # 1. Calculations (Using filtered data)
-    total_salary = df_salary["Salary Credited"].sum()
-    total_other_income = df_other["Amount"].sum()
-    total_income = total_salary + total_other_income
-    total_expenses = df_exp["Amount"].sum()
-    total_investments = df_inv["Total Amount Invested"].sum()
-    
-    net_worth = total_income - total_expenses
-    liquid_balance = net_worth - total_investments
-    savings_rate = ((total_income - total_expenses) / total_income * 100) if total_income > 0 else 0
+    df_sal = filter_df(st.session_state.data["MAIN SALARY"].copy(), period=period)
+    df_inc = filter_df(st.session_state.data["OTHER INCOME"].copy(), period=period)
+    df_exp = filter_df(st.session_state.data["EXPENSES"].copy(), period=period)
+    df_inv = filter_df(st.session_state.data["SHARES and FUNDS"].copy(), period=period)
 
-# --- UPDATED METRICS SECTION ---
-    
-    # 2. Key Metrics Display
-    st.subheader("Financial Overview")
-    
-    # Row 1: The Three Requested Fields
+    total_salary    = df_sal["Salary Credited"].sum()
+    total_other_inc = df_inc["Amount"].sum()
+    total_income    = total_salary + total_other_inc
+    total_expenses  = df_exp["Amount"].sum()
+    total_invested  = df_inv["Total Amount Invested"].sum()
+    net_worth       = total_income - total_expenses
+    liquid          = net_worth - total_invested
+    savings_rate    = (total_income - total_expenses) / total_income * 100 if total_income else 0
+
+    # Key metrics
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Net Worth", f"₹{net_worth:,.2f}", help="Total Income - Total Expenses")
-    m2.metric("Total Income", f"₹{total_income:,.2f}")
-    m3.metric("Total Salary", f"₹{total_salary:,.2f}")
-    m4.metric("Savings Rate", f"{savings_rate:.1f}%")
-    # Row 2: Secondary Metrics
-    st.divider()
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total Other Income", f"₹{total_other_income:,.2f}")
-    c2.metric("Total Expenses", f"₹{total_expenses:,.2f}", delta=f"{(total_expenses/total_income*100) if total_income > 0 else 0:.1f}% of Income", delta_color="inverse")
-    c3.metric("Total Invested", f"₹{total_investments:,.2f}")
-    c4.metric("Liquid Balance", f"₹{liquid_balance:,.2f}", help="Cash remaining after expenses and investments")
+    m1.metric("Net Worth",     f"₹{net_worth:,.0f}", help="Income − Expenses")
+    m2.metric("Total Income",  f"₹{total_income:,.0f}")
+    m3.metric("Total Expenses",f"₹{total_expenses:,.0f}",
+              delta=f"{total_expenses/total_income*100:.1f}% of income" if total_income else "",
+              delta_color="inverse")
+    m4.metric("Savings Rate",  f"{savings_rate:.1f}%")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Salary",        f"₹{total_salary:,.0f}")
+    c2.metric("Other Income",  f"₹{total_other_inc:,.0f}")
+    c3.metric("Liquid Balance",f"₹{liquid:,.0f}")
 
     st.divider()
 
-    # --- VISUALIZATIONS (Updated for Salary vs Other Income) ---
-    col_chart1, col_chart2 = st.columns(2)
+    # ── Charts ──
+    ch1, ch2 = st.columns(2)
 
-    with col_chart1:
-        st.subheader("Income Distribution")
-        income_df = pd.DataFrame({
-            "Source": ["Main Salary", "Other Income"],
-            "Amount": [total_salary, total_other_income]
-        })
-        fig_inc = px.pie(income_df, values='Amount', names='Source', hole=0.4,
-                         color_discrete_sequence=["#2ecc71", "#27ae60"])
-        st.plotly_chart(fig_inc, use_container_width=True)
+    with ch1:
+        st.markdown("#### Income breakdown")
+        fig = px.pie(
+            pd.DataFrame({"Source": ["Salary", "Other"], "Amount": [total_salary, total_other_inc]}),
+            values="Amount", names="Source", hole=0.4,
+            color_discrete_sequence=["#2ecc71", "#27ae60"],
+        )
+        fig.update_layout(margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
 
-    with col_chart2:
-        st.subheader("Expense Breakdown")
-        if not st.session_state.data["EXPENSES"].empty:
-            df_exp_grouped = st.session_state.data["EXPENSES"].groupby("Expense Type")["Amount"].sum().reset_index()
-            fig_pie = px.pie(df_exp_grouped, values='Amount', names='Expense Type', hole=0.4,
-                             color_discrete_sequence=px.colors.sequential.RdBu)
-            st.plotly_chart(fig_pie, use_container_width=True)
+    with ch2:
+        st.markdown("#### Expense breakdown")
+        if not df_exp.empty:
+            grp = df_exp.groupby("Expense Type")["Amount"].sum().reset_index()
+            fig = px.pie(grp, values="Amount", names="Expense Type", hole=0.4,
+                         color_discrete_sequence=px.colors.qualitative.Pastel)
+            fig.update_layout(margin=dict(t=10, b=10))
+            st.plotly_chart(fig, use_container_width=True)
         else:
-            st.info("No expense data.")
+            st.info("No expense data for selected period.")
 
-    st.subheader("Investment Portfolio")
-    if not st.session_state.data["SHARES and FUNDS"].empty:
-        df_inv_grouped = st.session_state.data["SHARES and FUNDS"].groupby("Share/Fund Name")["Total Amount Invested"].sum().reset_index()
-        fig_inv = px.bar(df_inv_grouped, x='Share/Fund Name', y='Total Amount Invested', 
-                         color='Total Amount Invested', labels={'Total Amount Invested': 'Amount (₹)'})
-        st.plotly_chart(fig_inv, use_container_width=True)
+    # Monthly trend (always all-time for trend purposes)
+    st.markdown("#### Monthly income vs expenses trend")
+    df_sal_all = st.session_state.data["MAIN SALARY"].copy()
+    df_inc_all = st.session_state.data["OTHER INCOME"].copy()
+    df_exp_all = st.session_state.data["EXPENSES"].copy()
 
-    st.divider()
+    if not df_exp_all.empty or not df_sal_all.empty:
+        df_sal_all["Date"] = pd.to_datetime(df_sal_all["Date"], errors="coerce")
+        df_inc_all["Date"] = pd.to_datetime(df_inc_all["Date"], errors="coerce")
+        df_exp_all["Date"] = pd.to_datetime(df_exp_all["Date"], errors="coerce")
 
-    # --- ROBUST AI INSIGHTS ---
-    if st.button("Generate Professional Financial Report"):
-        with st.spinner("Analyzing financial patterns..."):
-            # Prepare data summaries for the AI
-            exp_summary = st.session_state.data["EXPENSES"].groupby("Expense Type")["Amount"].sum().to_dict()
-            inv_summary = st.session_state.data["SHARES and FUNDS"].groupby("Share/Fund Name")["Total Amount Invested"].sum().to_dict()
-            
-            robust_prompt = f"""
-            Act as a Senior Certified Financial Planner (CFP). Analyze the following personal financial data and provide a strictly formatted report.
+        sal_monthly = df_sal_all.set_index("Date")["Salary Credited"].resample("ME").sum().reset_index()
+        sal_monthly.columns = ["Month", "Amount"]
+        sal_monthly["Type"] = "Salary"
 
-            ### DATA SUMMARY:
-            - Total Monthly Income: ₹{total_income}
-            - Total Expenses: ₹{total_expenses}
-            - Total Invested: ₹{total_investments}
-            - Current Liquidity: ₹{liquid_balance}
-            - Expense Categories: {exp_summary}
-            - Investment Portfolio: {inv_summary}
+        inc_monthly = df_inc_all.set_index("Date")["Amount"].resample("ME").sum().reset_index()
+        inc_monthly.columns = ["Month", "Amount"]
+        inc_monthly["Type"] = "Other Income"
 
-            ### REPORT REQUIREMENTS:
-            1. **Executive Summary**: A 2-sentence overview of the current financial health.
-            2. **Spending Analysis**: Identify the top 3 expense categories. Comment on the 'Savings Rate' (calculated as (Income - Expenses)/Income).
-            3. **The 50/30/20 Rule Check**: Compare current spending against this rule (50% Needs, 30% Wants, 20% Savings/Investments).
-            4. **Optimization Strategy**: Give 3 specific, actionable tips to reduce the highest expense categories found in the data.
-            5. **Investment Critique**: Analyze the current portfolio distribution. Suggest if there's an over-concentration in one asset.
-            6. **Action Plan**: Provide a 'Next 30 Days' checklist to increase the net balance.
+        exp_monthly = df_exp_all.set_index("Date")["Amount"].resample("ME").sum().reset_index()
+        exp_monthly.columns = ["Month", "Amount"]
+        exp_monthly["Type"] = "Expenses"
 
-            Use Markdown for formatting. Be direct, professional, and data-driven.
-            """
-            
-            try:
-                response = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": robust_prompt}])
-                st.markdown("---")
-                st.markdown(response['message']['content'])
-            except Exception as e:
-                st.error(f"AI Analysis Failed: {str(e)}")
+        trend_df = pd.concat([sal_monthly, inc_monthly, exp_monthly])
+        trend_df["Month"] = trend_df["Month"].dt.strftime("%b %Y")
+
+        fig = px.bar(trend_df, x="Month", y="Amount", color="Type", barmode="group",
+                     color_discrete_map={"Salary": "#2ecc71", "Other Income": "#27ae60", "Expenses": "#e74c3c"})
+        fig.update_layout(margin=dict(t=10, b=10), xaxis_tickangle=-30)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Investment chart
+    st.markdown("#### Investment portfolio")
+    if not df_inv.empty:
+        grp = df_inv.groupby("Share/Fund Name")["Total Amount Invested"].sum().reset_index()
+        fig = px.bar(grp, x="Share/Fund Name", y="Total Amount Invested",
+                     color="Total Amount Invested",
+                     color_continuous_scale="Teal",
+                     labels={"Total Amount Invested": "Amount (₹)"})
+        fig.update_layout(margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Budget vs Actual
+    if st.session_state.budgets:
+        st.markdown("#### Budget vs Actual (this month)")
+        bgt_rows = []
+        for cat, lim in st.session_state.budgets.items():
+            s = budget_status(cat)
+            spent = s[0] if s else 0
+            bgt_rows.append({"Category": cat, "Budget": lim, "Spent": spent})
+        bgt_df = pd.DataFrame(bgt_rows)
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name="Budget",  x=bgt_df["Category"], y=bgt_df["Budget"],  marker_color="#3498db"))
+        fig.add_trace(go.Bar(name="Spent",   x=bgt_df["Category"], y=bgt_df["Spent"],   marker_color="#e74c3c"))
+        fig.update_layout(barmode="group", margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+# ── TAB: AI ADVISOR ────────────────────────────────────────────────────────────
+with tab_ai:
+    st.subheader("🤖 AI Financial Advisor")
+
+    ai_tab1, ai_tab2 = st.tabs(["💬 Chat", "📋 Full Report"])
+
+    with ai_tab1:
+        st.caption("Ask anything about your finances. The AI has full access to your data.")
+
+        # Display chat history
+        for msg in st.session_state.ai_chat_history:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+
+        # Suggested prompts
+        if not st.session_state.ai_chat_history:
+            st.markdown("**Suggested questions:**")
+            suggestions = [
+                "What is my savings rate and is it healthy?",
+                "Which category am I overspending on?",
+                "Can I afford to invest ₹10,000 more per month?",
+                "How long will it take to reach my goals at this rate?",
+                "What's my biggest financial risk right now?",
+            ]
+            cols = st.columns(len(suggestions))
+            for i, q in enumerate(suggestions):
+                if cols[i].button(q, key=f"sugg_{i}"):
+                    st.session_state.ai_chat_history.append({"role": "user", "content": q})
+                    with st.spinner("Thinking…"):
+                        reply = get_ai_chat_response(q)
+                    st.session_state.ai_chat_history.append({"role": "assistant", "content": reply})
+                    st.rerun()
+
+        if prompt := st.chat_input("Ask your advisor…"):
+            st.session_state.ai_chat_history.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
+            with st.chat_message("assistant"):
+                with st.spinner("Thinking…"):
+                    reply = get_ai_chat_response(prompt)
+                st.markdown(reply)
+            st.session_state.ai_chat_history.append({"role": "assistant", "content": reply})
+
+        if st.session_state.ai_chat_history:
+            if st.button("🗑 Clear Chat"):
+                st.session_state.ai_chat_history = []
+                st.rerun()
+
+    with ai_tab2:
+        st.caption("A comprehensive CFP-style analysis of your full financial picture.")
+        if st.button("📊 Generate Full Report"):
+            with st.spinner("Analysing your finances…"):
+                report = get_ai_report()
+            st.markdown("---")
+            st.markdown(report)
