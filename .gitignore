@@ -3,6 +3,9 @@
 *.xlsx
 *.xls
 
+# JSON data files
+*.json
+
 # Python
 __pycache__/
 *.py[cod]
