@@ -45,6 +45,10 @@ pip install -r requirements.txt
 ```bash
 streamlit run tracker_sql.py
 ```
+### Or if you want Excel storage
+```bash
+streamlit run main.py
+```
 
 ### Option 2: Using the batch file (Windows)
 ```bash
