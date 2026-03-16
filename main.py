@@ -73,7 +73,8 @@ def load_goals():
                 "title": "Honda CB500", 
                 "desc": "Motorcycle purchase fund", 
                 "target": 500000.0, 
-                "include_investments": False
+                "include_investments": False,
+                "target_date": (datetime.date.today() + datetime.timedelta(days=365)).strftime("%Y-%m-%d")
             }]
             save_goals()
 
@@ -294,25 +295,27 @@ with tab3:
         st.success("Investment added!")
 
 # TAB 4: GOALS
-# TAB 4: GOALS
 with tab_goals:
     st.subheader("Financial Goals Tracker")
 
-    # 1. Calculate available pools of money
     global_income = st.session_state.data["MAIN SALARY"]["Salary Credited"].sum() + st.session_state.data["OTHER INCOME"]["Amount"].sum()
     global_exp = st.session_state.data["EXPENSES"]["Amount"].sum()
     global_inv = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
     
     total_liquid = (global_income - global_exp) - global_inv
-    total_wealth = global_income - global_exp # Liquid + Investments
+    total_wealth = global_income - global_exp 
 
-    # 2. Add New Goal Form (CREATE)
+    # --- CREATE ---
     with st.expander("➕ Create New Goal"):
         with st.form("new_goal_form"):
             new_title = st.text_input("Goal Title")
             new_desc = st.text_input("Description")
-            new_target = st.number_input("Target Amount", min_value=1.0, step=1000.0)
-            include_inv = st.checkbox("Include Investments in Progress? (Check this if you plan to sell stocks for this goal)")
+            
+            col_t1, col_t2 = st.columns(2)
+            new_target = col_t1.number_input("Target Amount (₹)", min_value=1.0, step=1000.0)
+            new_date = col_t2.date_input("Target Date", min_value=datetime.date.today())
+            
+            include_inv = st.checkbox("Include Investments in Progress?")
             
             if st.form_submit_button("Save Goal"):
                 import uuid
@@ -321,7 +324,8 @@ with tab_goals:
                     "title": new_title,
                     "desc": new_desc,
                     "target": new_target,
-                    "include_investments": include_inv
+                    "include_investments": include_inv,
+                    "target_date": new_date.strftime("%Y-%m-%d")
                 }
                 st.session_state.goals.append(new_goal)
                 save_goals()
@@ -330,9 +334,11 @@ with tab_goals:
 
     st.divider()
 
-    # 3. Display and Manage Existing Goals (READ, UPDATE, DELETE)
+    # --- READ, UPDATE, DELETE ---
     if not st.session_state.goals:
         st.info("No active goals. Create one above!")
+    
+    today = datetime.date.today()
     
     for i, goal in enumerate(st.session_state.goals):
         with st.container(border=True):
@@ -342,39 +348,52 @@ with tab_goals:
                 st.markdown(f"### {goal['title']}")
                 if goal['desc']: st.caption(f"{goal['desc']}")
                 
-                # Dynamic progress calculation based on customization
+                # Progress Math
                 current_funds = total_wealth if goal.get("include_investments", False) else total_liquid
-                current_funds = max(0, current_funds) # Prevent negative progress visual bug
+                current_funds = max(0, current_funds)
                 progress_val = min(current_funds / goal['target'], 1.0) if goal['target'] > 0 else 0.0
-                
                 st.progress(progress_val)
                 
-                source_text = "Net Worth (Cash + Invested)" if goal.get("include_investments", False) else "Liquid Cash Only"
-                st.metric(label=f"Progress ({source_text})", 
+                # Date & Monthly Savings Math
+                target_dt = datetime.datetime.strptime(goal.get('target_date', (today + datetime.timedelta(days=365)).strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+                months_remaining = (target_dt.year - today.year) * 12 + target_dt.month - today.month
+                months_remaining = max(1, months_remaining) # Prevent division by zero
+                
+                remaining_amt = max(0, goal['target'] - current_funds)
+                monthly_req = remaining_amt / months_remaining
+                
+                st.metric(label=f"Progress ({'Net Worth' if goal.get('include_investments', False) else 'Liquid Cash'})", 
                           value=f"₹{current_funds:,.2f} / ₹{goal['target']:,.2f}", 
                           delta=f"{(progress_val*100):.1f}% Funded",
                           delta_color="normal" if progress_val < 1.0 else "off")
                 
                 if progress_val >= 1.0:
                     st.success("🎉 Target Reached!")
+                else:
+                    st.info(f"📅 Target: **{target_dt.strftime('%b %Y')}** ({months_remaining} months left) | 💡 Required: **₹{monthly_req:,.2f} / month**")
 
             with col_actions:
-                with st.expander("Edit / Delete"):
-                    edit_title = st.text_input("Title", value=goal['title'], key=f"title_{goal['id']}")
-                    edit_desc = st.text_input("Desc", value=goal['desc'], key=f"desc_{goal['id']}")
-                    edit_target = st.number_input("Target", value=float(goal['target']), step=1000.0, key=f"target_{goal['id']}")
-                    edit_inc_inv = st.checkbox("Include Investments", value=goal.get('include_investments', False), key=f"inc_{goal['id']}")
+                with st.expander("Edit"):
+                    edit_title = st.text_input("Title", value=goal['title'], key=f"title_{i}_{goal['id']}")
+                    edit_desc = st.text_input("Desc", value=goal['desc'], key=f"desc_{i}_{goal['id']}")
+                    edit_target = st.number_input("Target", value=float(goal['target']), step=1000.0, key=f"target_{i}_{goal['id']}")
+                    
+                    fallback_dt = datetime.datetime.strptime(goal.get('target_date', today.strftime("%Y-%m-%d")), "%Y-%m-%d").date()
+                    edit_date = st.date_input("Date", value=fallback_dt, key=f"date_{i}_{goal['id']}")
+                    
+                    edit_inc_inv = st.checkbox("Include Inv.", value=goal.get('include_investments', False), key=f"inc_{i}_{goal['id']}")
                     
                     c_save, c_del = st.columns(2)
-                    if c_save.button("Save", key=f"save_{goal['id']}"):
+                    if c_save.button("Save", key=f"save_{i}_{goal['id']}"):
                         st.session_state.goals[i].update({
                             "title": edit_title, "desc": edit_desc, 
-                            "target": edit_target, "include_investments": edit_inc_inv
+                            "target": edit_target, "include_investments": edit_inc_inv,
+                            "target_date": edit_date.strftime("%Y-%m-%d")
                         })
                         save_goals()
                         st.rerun()
                         
-                    if c_del.button("Delete", type="primary", key=f"del_{goal['id']}"):
+                    if c_del.button("Del", type="primary", key=f"del_{i}_{goal['id']}"):
                         st.session_state.goals.pop(i)
                         save_goals()
                         st.rerun()
