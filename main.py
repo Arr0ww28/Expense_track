@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 EXCEL_FILE = "finance_tracker.xlsx"
 LLM_MODEL = "qwen3-coder:latest"
 CUSTOM_CATEGORIES_FILE = "custom_categories.json"
+GOALS_FILE ="goals.json"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -41,6 +42,7 @@ def search_ticker(query):
     except Exception as e:
         return [], str(e)
 
+@st.cache_data(ttl=300, show_spinner=False)
 def get_live_stock_data(ticker_symbol):
     try:
         session = curl_requests.Session(impersonate="chrome")
@@ -58,6 +60,33 @@ def get_live_stock_data(ticker_symbol):
         return None
 
 # --- DATA MANAGEMENT ---
+def load_goals():
+    if 'goals' not in st.session_state:
+        if os.path.exists(GOALS_FILE):
+            import json
+            with open(GOALS_FILE, 'r') as f:
+                st.session_state.goals = json.load(f)
+        else:
+            # Initialize with an example goal
+            st.session_state.goals = [{
+                "id": "init_1", 
+                "title": "Honda CB500", 
+                "desc": "Motorcycle purchase fund", 
+                "target": 500000.0, 
+                "include_investments": False
+            }]
+            save_goals()
+
+def save_goals():
+    import json
+    with open(GOALS_FILE, 'w') as f:
+        json.dump(st.session_state.goals, f)
+def undo_last_entry(sheet_name):
+    if not st.session_state.data[sheet_name].empty:
+        st.session_state.data[sheet_name] = st.session_state.data[sheet_name].iloc[:-1]
+        save_all_to_excel()
+        st.success(f"Last entry removed from {sheet_name}!")
+        st.rerun()
 def add_new_category(new_cat):
     if new_cat and new_cat not in st.session_state.custom_categories:
         st.session_state.custom_categories.append(new_cat)
@@ -85,6 +114,7 @@ def init_data():
             pd.DataFrame(columns=["Sr No", "Date", "Share/Fund Name", "Quantity", "Total Amount Invested"]).to_excel(writer, sheet_name="SHARES and FUNDS", index=False)
     
     load_custom_categories()
+    load_goals()
     
     if 'data' not in st.session_state:
         st.session_state.data = {
@@ -147,7 +177,7 @@ if 'watchlist' not in st.session_state:
 
 st.title("Salary & Expense Tracker")
 
-tab1, tab_inc, tab2, tab3, tab5, tab6 = st.tabs(["Main Salary", "Other Income", "Expenses", "Shares & Funds", "Manage Data", "Dashboard & AI"])
+tab1, tab_inc, tab2, tab3, tab_goals,tab5, tab6 = st.tabs(["Main Salary", "Other Income", "Expenses", "Shares & Funds", "Goals","Manage Data", "Dashboard & AI"])
 system_date = datetime.date.today().strftime("%Y-%m-%d")
 
 # Sidebar
@@ -246,6 +276,10 @@ with tab2:
         save_all_to_excel()
         st.success(f"Expense logged under {final_type}!")
         st.rerun()
+    # Add to bottom of EXPENSES tab
+    if not st.session_state.data["EXPENSES"].empty:
+        if st.button("↩️ Undo Last Expense", key="undo_exp"):
+            undo_last_entry("EXPENSES")
 
 # TAB 3: INVESTMENTS
 with tab3:
@@ -259,6 +293,92 @@ with tab3:
         save_all_to_excel()
         st.success("Investment added!")
 
+# TAB 4: GOALS
+# TAB 4: GOALS
+with tab_goals:
+    st.subheader("Financial Goals Tracker")
+
+    # 1. Calculate available pools of money
+    global_income = st.session_state.data["MAIN SALARY"]["Salary Credited"].sum() + st.session_state.data["OTHER INCOME"]["Amount"].sum()
+    global_exp = st.session_state.data["EXPENSES"]["Amount"].sum()
+    global_inv = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
+    
+    total_liquid = (global_income - global_exp) - global_inv
+    total_wealth = global_income - global_exp # Liquid + Investments
+
+    # 2. Add New Goal Form (CREATE)
+    with st.expander("➕ Create New Goal"):
+        with st.form("new_goal_form"):
+            new_title = st.text_input("Goal Title")
+            new_desc = st.text_input("Description")
+            new_target = st.number_input("Target Amount", min_value=1.0, step=1000.0)
+            include_inv = st.checkbox("Include Investments in Progress? (Check this if you plan to sell stocks for this goal)")
+            
+            if st.form_submit_button("Save Goal"):
+                import uuid
+                new_goal = {
+                    "id": str(uuid.uuid4()),
+                    "title": new_title,
+                    "desc": new_desc,
+                    "target": new_target,
+                    "include_investments": include_inv
+                }
+                st.session_state.goals.append(new_goal)
+                save_goals()
+                st.success("Goal Added!")
+                st.rerun()
+
+    st.divider()
+
+    # 3. Display and Manage Existing Goals (READ, UPDATE, DELETE)
+    if not st.session_state.goals:
+        st.info("No active goals. Create one above!")
+    
+    for i, goal in enumerate(st.session_state.goals):
+        with st.container(border=True):
+            col_info, col_actions = st.columns([3, 1])
+            
+            with col_info:
+                st.markdown(f"### {goal['title']}")
+                if goal['desc']: st.caption(f"{goal['desc']}")
+                
+                # Dynamic progress calculation based on customization
+                current_funds = total_wealth if goal.get("include_investments", False) else total_liquid
+                current_funds = max(0, current_funds) # Prevent negative progress visual bug
+                progress_val = min(current_funds / goal['target'], 1.0) if goal['target'] > 0 else 0.0
+                
+                st.progress(progress_val)
+                
+                source_text = "Net Worth (Cash + Invested)" if goal.get("include_investments", False) else "Liquid Cash Only"
+                st.metric(label=f"Progress ({source_text})", 
+                          value=f"₹{current_funds:,.2f} / ₹{goal['target']:,.2f}", 
+                          delta=f"{(progress_val*100):.1f}% Funded",
+                          delta_color="normal" if progress_val < 1.0 else "off")
+                
+                if progress_val >= 1.0:
+                    st.success("🎉 Target Reached!")
+
+            with col_actions:
+                with st.expander("Edit / Delete"):
+                    edit_title = st.text_input("Title", value=goal['title'], key=f"title_{goal['id']}")
+                    edit_desc = st.text_input("Desc", value=goal['desc'], key=f"desc_{goal['id']}")
+                    edit_target = st.number_input("Target", value=float(goal['target']), step=1000.0, key=f"target_{goal['id']}")
+                    edit_inc_inv = st.checkbox("Include Investments", value=goal.get('include_investments', False), key=f"inc_{goal['id']}")
+                    
+                    c_save, c_del = st.columns(2)
+                    if c_save.button("Save", key=f"save_{goal['id']}"):
+                        st.session_state.goals[i].update({
+                            "title": edit_title, "desc": edit_desc, 
+                            "target": edit_target, "include_investments": edit_inc_inv
+                        })
+                        save_goals()
+                        st.rerun()
+                        
+                    if c_del.button("Delete", type="primary", key=f"del_{goal['id']}"):
+                        st.session_state.goals.pop(i)
+                        save_goals()
+                        st.rerun()
+
 # TAB 5: MANAGE
 with tab5:
     sheet_choice = st.selectbox("Edit Sheet", ["MAIN SALARY", "OTHER INCOME", "EXPENSES", "SHARES and FUNDS"])
@@ -268,19 +388,31 @@ with tab5:
         success, msg = save_all_to_excel()
         st.success(msg) if success else st.error(msg)
 
-# --- TAB 6: DASHBOARD & AI ---
 with tab6:
-    # 1. Calculations
-    total_salary = st.session_state.data["MAIN SALARY"]["Salary Credited"].sum()
-    total_other_income = st.session_state.data["OTHER INCOME"]["Amount"].sum()
+    st.subheader("Financial Overview")
+    
+    # --- TIME FILTER ---
+    filter_option = st.radio("Timeframe", ["All Time", "Current Month"], horizontal=True)
+    
+    def filter_df(df, date_col="Date"):
+        if filter_option == "All Time" or df.empty: return df
+        df[date_col] = pd.to_datetime(df[date_col])
+        current_month = datetime.date.today().month
+        current_year = datetime.date.today().year
+        return df[(df[date_col].dt.month == current_month) & (df[date_col].dt.year == current_year)]
+
+    df_salary = filter_df(st.session_state.data["MAIN SALARY"].copy())
+    df_other = filter_df(st.session_state.data["OTHER INCOME"].copy())
+    df_exp = filter_df(st.session_state.data["EXPENSES"].copy())
+    df_inv = filter_df(st.session_state.data["SHARES and FUNDS"].copy())
+
+    # 1. Calculations (Using filtered data)
+    total_salary = df_salary["Salary Credited"].sum()
+    total_other_income = df_other["Amount"].sum()
     total_income = total_salary + total_other_income
+    total_expenses = df_exp["Amount"].sum()
+    total_investments = df_inv["Total Amount Invested"].sum()
     
-    total_expenses = st.session_state.data["EXPENSES"]["Amount"].sum()
-    total_investments = st.session_state.data["SHARES and FUNDS"]["Total Amount Invested"].sum()
-    
-    # Net Worth Calculation: Total Income - Total Expenses
-    # (Note: Investments are part of Net Worth, so we don't subtract them from wealth, 
-    # only from "Liquid Balance")
     net_worth = total_income - total_expenses
     liquid_balance = net_worth - total_investments
     savings_rate = ((total_income - total_expenses) / total_income * 100) if total_income > 0 else 0
