@@ -1035,7 +1035,7 @@ with tab_dashboard:
         fig = px.pie(
             pd.DataFrame({"Source": ["Salary", "Other"], "Amount": [total_salary, total_other_inc]}),
             values="Amount", names="Source", hole=0.4,
-            color_discrete_sequence=["#2ecc71", "#27ae60"])
+            color_discrete_sequence=["#03e6ff", "#4aef8f"])
         fig.update_layout(margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1075,9 +1075,9 @@ with tab_dashboard:
         trend_df = pd.concat([sal_m, inc_m, exp_m])
         trend_df["Month"] = trend_df["Month"].dt.strftime("%b %Y")
         fig = px.bar(trend_df, x="Month", y="Amount", color="Type", barmode="group",
-                     color_discrete_map={"Salary": "#2ecc71",
-                                         "Other Income": "#27ae60",
-                                         "Expenses": "#e74c3c"})
+                     color_discrete_map={"Salary": "#03e6ff",
+                                         "Other Income": "#4aef8f",
+                                         "Expenses": "#ff6b6b"})
         fig.update_layout(margin=dict(t=10, b=10), xaxis_tickangle=-30)
         st.plotly_chart(fig, use_container_width=True)
 
@@ -1153,8 +1153,64 @@ with tab_ai:
 
     with ai_tab2:
         st.caption("A comprehensive CFP-style analysis of your full financial picture.")
-        if st.button("Generate Full Report"):
+        if st.button("📊 Generate Full Report"):
             with st.spinner("Analysing your finances…"):
                 report = get_ai_report()
+            st.session_state["last_report"] = report
+ 
+        if "last_report" in st.session_state:
+            report = st.session_state["last_report"]
             st.markdown("---")
-            st.markdown(report)
+            # Convert markdown to HTML so tables and checkboxes render correctly
+            try:
+                import markdown as md_lib
+                html = md_lib.markdown(
+                    report,
+                    extensions=["tables", "nl2br", "sane_lists"],
+                )
+                # Style the table and checkboxes to match Streamlit's look
+                styled = f"""
+                <style>
+                  .report-body table {{
+                    border-collapse: collapse;
+                    width: 100%;
+                    margin: 1rem 0;
+                    font-size: 0.9rem;
+                  }}
+                  .report-body th, .report-body td {{
+                    border: 1px solid rgba(128,128,128,0.3);
+                    padding: 8px 12px;
+                    text-align: left;
+                  }}
+                  .report-body th {{
+                    background: rgba(128,128,128,0.15);
+                    font-weight: 600;
+                  }}
+                  .report-body tr:nth-child(even) {{
+                    background: rgba(128,128,128,0.05);
+                  }}
+                  .report-body li input[type=checkbox] {{
+                    margin-right: 6px;
+                  }}
+                  .report-body h1 {{ font-size: 1.6rem; margin-top: 1.2rem; }}
+                  .report-body h2 {{ font-size: 1.3rem; margin-top: 1rem; }}
+                  .report-body h3 {{ font-size: 1.1rem; }}
+                </style>
+                <div class="report-body">{html}</div>
+                """
+                st.html(styled)
+            except ImportError:
+                # Fallback: plain st.markdown if the markdown package isn't installed
+                st.warning(
+                    "Install the `markdown` package for full table rendering: "
+                    "`pip install markdown`"
+                )
+                st.markdown(report, unsafe_allow_html=True)
+ 
+            # Download button for the report
+            st.download_button(
+                "⬇ Download Report (Markdown)",
+                data=report,
+                file_name=f"financial_report_{datetime.date.today()}.md",
+                mime="text/markdown",
+            )
