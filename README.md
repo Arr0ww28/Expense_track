@@ -25,7 +25,7 @@ A comprehensive personal finance tracking application built with Streamlit and S
 1. Clone the repository:
 ```bash
 git clone https://github.com/Arr0ww28/Expense_track.git
-cd expense_tracker
+cd Expense_track
 ```
 
 2. Create a virtual environment:
