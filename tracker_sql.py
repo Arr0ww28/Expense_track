@@ -539,7 +539,7 @@ with tab_expenses:
     c1, c2   = st.columns(2)
     exp_date = c1.date_input("Date", value=datetime.date.today(), key="exp_dt").strftime("%Y-%m-%d")
     base_exp = ["Rent", "Groceries", "Utilities", "Transport", "Entertainment",
-                "Healthcare", "Dining Out", "Shopping", "Education", "Subscriptions"]
+                "Healthcare", "Food", "Clothing", "Education", "Subscriptions"]
     all_exp  = sorted(set(base_exp + st.session_state.custom_exp_cats)) + ["Custom…"]
     exp_type = c2.selectbox("Expense Type", all_exp, key="exp_tp")
     custom_exp = ""
@@ -789,7 +789,7 @@ with tab_budget:
     st.caption("Set a spending ceiling per category. You'll be alerted when you approach or exceed it.")
     all_cats = sorted(set(
         ["Rent", "Groceries", "Utilities", "Transport", "Entertainment",
-         "Healthcare", "Dining Out", "Shopping", "Education", "Subscriptions"]
+         "Healthcare", "Food", "Clothing", "Education", "Subscriptions"]
         + st.session_state.custom_exp_cats
     ))
     with st.form("budget_form"):
@@ -817,13 +817,34 @@ with tab_budget:
                 spent, lim, pct = s
                 remaining = lim - spent
                 color = "🔴" if pct >= 1 else ("🟡" if pct >= 0.8 else "🟢")
-                c1, c2 = st.columns([3, 1])
+                c1, c2, c3 = st.columns([2.5, 1, 0.5])
                 c1.markdown(f"{color} **{cat}**")
                 c1.progress(min(pct, 1.0))
                 c2.metric("Spent / Limit", f"₹{spent:,.0f}", f"₹{remaining:,.0f} left",
                           delta_color="inverse")
+                if c3.button("Delete", key=f"del_bgt_{cat}", help="Delete budget", use_container_width=True):
+                    del st.session_state.budgets[cat]
+                    save_budgets()
+                    st.rerun()
     else:
         st.info("No budgets set yet.")
+
+    st.divider()
+    st.subheader("Custom Expense Categories")
+    if st.session_state.custom_exp_cats:
+        st.markdown("**Your custom categories:**")
+        for cat in st.session_state.custom_exp_cats:
+            col_cat, col_keep, col_del = st.columns([3, 1, 0.8])
+            col_cat.write(f"• {cat}")
+            if col_keep.button("✓ Keep", key=f"keep_cat_{cat}", help="Confirm to keep this category"):
+                st.toast(f"✓ '{cat}' will be retained", icon="✓")
+            if col_del.button("✕", key=f"del_cat_{cat}", help="Remove category"):
+                st.session_state.custom_exp_cats.remove(cat)
+                save_json(CUSTOM_CATS_EXP_FILE, st.session_state.custom_exp_cats)
+                st.success(f"Category '{cat}' removed!")
+                st.rerun()
+    else:
+        st.caption("No custom categories created yet.")
 
 # ── TAB: RECURRING ─────────────────────────────────────────────────────────────
 with tab_recurring:

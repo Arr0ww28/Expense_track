@@ -37,3 +37,6 @@ Thumbs.db
 # Local data files (optional - add any other local files)
 *.pyc
 .pytest_cache/
+
+#vscode sessions
+.vscode/sessions.json
