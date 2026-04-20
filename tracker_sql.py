@@ -31,6 +31,7 @@ TABLE_MAP = {
     "OTHER INCOME":     "other_income",
     "EXPENSES":         "expenses",
     "SHARES and FUNDS": "investments",
+    "BANK DEPOSITS":    "bank_deposits",
 }
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -86,29 +87,56 @@ def init_db():
             quantity REAL,
             cost     REAL
         )""")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS bank_deposits (
+            sr_no         INTEGER,
+            date          TEXT,
+            bank_name     TEXT,
+            deposit_type  TEXT,
+            amount        REAL,
+            tenure_months INTEGER,
+            interest_rate REAL,
+            maturity_date TEXT,
+            notes         TEXT
+        )""")
     conn.commit()
     conn.close()
 
 def load_all_data():
-    """Read all four tables from SQLite into DataFrames with display column names."""
+    """Read all five tables from SQLite into DataFrames with display column names."""
     conn = get_conn()
+    
+    def safe_read(query, col_map):
+        """Safely read SQL, returning empty DataFrame with correct columns if table doesn't exist."""
+        try:
+            return pd.read_sql(query, conn)
+        except Exception:
+            return pd.DataFrame(columns=col_map.keys())
+    
     data = {
-        "MAIN SALARY": pd.read_sql(
+        "MAIN SALARY": safe_read(
             "SELECT sr_no AS 'Sr No', date AS 'Date', salary AS 'Salary Credited' FROM main_salary",
-            conn),
-        "OTHER INCOME": pd.read_sql(
+            {"Sr No": None, "Date": None, "Salary Credited": None}),
+        "OTHER INCOME": safe_read(
             "SELECT sr_no AS 'Sr No', date AS 'Date', income_type AS 'Income Type', "
             "amount AS 'Amount', notes AS 'Notes' FROM other_income",
-            conn),
-        "EXPENSES": pd.read_sql(
+            {"Sr No": None, "Date": None, "Income Type": None, "Amount": None, "Notes": None}),
+        "EXPENSES": safe_read(
             "SELECT sr_no AS 'Sr No', date AS 'Date', expense_type AS 'Expense Type', "
             "amount AS 'Amount', notes AS 'Notes' FROM expenses",
-            conn),
-        "SHARES and FUNDS": pd.read_sql(
+            {"Sr No": None, "Date": None, "Expense Type": None, "Amount": None, "Notes": None}),
+        "SHARES and FUNDS": safe_read(
             "SELECT sr_no AS 'Sr No', date AS 'Date', name AS 'Share/Fund Name', "
             "ticker AS 'Ticker', quantity AS 'Quantity', cost AS 'Total Amount Invested' "
             "FROM investments",
-            conn),
+            {"Sr No": None, "Date": None, "Share/Fund Name": None, "Ticker": None, "Quantity": None, "Total Amount Invested": None}),
+        "BANK DEPOSITS": safe_read(
+            "SELECT sr_no AS 'Sr No', date AS 'Date', bank_name AS 'Bank Name', "
+            "deposit_type AS 'Deposit Type', amount AS 'Amount', tenure_months AS 'Tenure (months)', "
+            "interest_rate AS 'Interest Rate (%)', maturity_date AS 'Maturity Date', notes AS 'Notes' "
+            "FROM bank_deposits",
+            {"Sr No": None, "Date": None, "Bank Name": None, "Deposit Type": None, "Amount": None, 
+             "Tenure (months)": None, "Interest Rate (%)": None, "Maturity Date": None, "Notes": None}),
     }
     conn.close()
     return data
@@ -129,6 +157,11 @@ _COL_MAP = {
     "SHARES and FUNDS": {
         "Sr No": "sr_no", "Date": "date", "Share/Fund Name": "name",
         "Ticker": "ticker", "Quantity": "quantity", "Total Amount Invested": "cost",
+    },
+    "BANK DEPOSITS": {
+        "Sr No": "sr_no", "Date": "date", "Bank Name": "bank_name",
+        "Deposit Type": "deposit_type", "Amount": "amount", "Tenure (months)": "tenure_months",
+        "Interest Rate (%)": "interest_rate", "Maturity Date": "maturity_date", "Notes": "notes",
     },
 }
 
@@ -359,15 +392,22 @@ def build_financial_context():
     df_inc = st.session_state.data["OTHER INCOME"]
     df_exp = st.session_state.data["EXPENSES"]
     df_inv = st.session_state.data["SHARES and FUNDS"]
+    df_dep = st.session_state.data["BANK DEPOSITS"]
 
     total_income   = df_sal["Salary Credited"].sum() + df_inc["Amount"].sum()
     total_expenses = df_exp["Amount"].sum()
     total_invested = df_inv["Total Amount Invested"].sum()
-    liquid         = total_income - total_expenses - total_invested
+    total_deposits = df_dep["Amount"].sum() if not df_dep.empty else 0
+    liquid         = total_income - total_expenses - total_invested - total_deposits
     savings_rate   = (total_income - total_expenses) / total_income * 100 if total_income else 0
 
     exp_by_cat  = df_exp.groupby("Expense Type")["Amount"].sum().to_dict() if not df_exp.empty else {}
     inv_by_name = df_inv.groupby("Share/Fund Name")["Total Amount Invested"].sum().to_dict() if not df_inv.empty else {}
+    
+    # Calculate total FD/RD interest
+    est_interest = 0
+    if not df_dep.empty:
+        est_interest = (df_dep["Amount"] * (df_dep["Interest Rate (%)"] / 100) * (df_dep["Tenure (months)"] / 12)).sum()
 
     monthly = {}
     if not df_exp.empty:
@@ -381,6 +421,7 @@ FINANCIAL SNAPSHOT (all-time):
 - Total income:   ₹{total_income:,.0f}  (Salary ₹{df_sal['Salary Credited'].sum():,.0f} + Other ₹{df_inc['Amount'].sum():,.0f})
 - Total expenses: ₹{total_expenses:,.0f}
 - Total invested: ₹{total_invested:,.0f}
+- Bank deposits (FD/RD): ₹{total_deposits:,.0f} (Est. Interest: ₹{est_interest:,.0f})
 - Liquid balance: ₹{liquid:,.0f}
 - Savings rate:   {savings_rate:.1f}%
 - Expense breakdown:           {exp_by_cat}
@@ -442,11 +483,11 @@ if "recurring_checked" not in st.session_state:
 today_str = datetime.date.today().strftime("%Y-%m-%d")
 st.title("Finance Tracker")
 
-(tab_salary, tab_income, tab_expenses, tab_invest,
+(tab_salary, tab_income, tab_expenses, tab_invest, tab_deposits,
  tab_goals, tab_budget, tab_recurring, tab_import,
  tab_manage, tab_dashboard, tab_ai) = st.tabs([
     "Salary", "Other Income", "Expenses",
-    "Investments", "Goals", "Budgets",
+    "Investments", "Bank Deposits", "Goals", "Budgets",
     "Recurring", "Import", "Manage Data",
     "Dashboard", "AI Advisor",
 ])
@@ -698,6 +739,59 @@ with tab_invest:
             with st.expander(f"⚠️ {len(fetch_errors)} fetch error(s)"):
                 for e in fetch_errors:
                     st.caption(e)
+
+# ── TAB: BANK DEPOSITS (FD/RD) ─────────────────────────────────────────────────
+with tab_deposits:
+    st.subheader("Bank Deposits (FD / RD)")
+    st.caption("Track Fixed Deposits and Recurring Deposits across banks. They will appear in the Dashboard.")
+    
+    c1, c2, c3 = st.columns(3)
+    dep_date = c1.date_input("Opening Date", value=datetime.date.today(), key="dep_dt").strftime("%Y-%m-%d")
+    dep_bank = c2.text_input("Bank Name", placeholder="e.g. HDFC, ICICI, SBI", key="dep_bank")
+    dep_type = c3.selectbox("Deposit Type", ["FD (Fixed Deposit)", "RD (Recurring Deposit)"], key="dep_type")
+    
+    c4, c5, c6 = st.columns(3)
+    dep_amt = c4.number_input("Amount (₹)", min_value=1.0, step=100.0, key="dep_amt")
+    dep_tenure = c5.number_input("Tenure (months)", min_value=1, step=1, key="dep_tenure")
+    dep_rate = c6.number_input("Interest Rate (%)", min_value=0.0, step=0.1, key="dep_rate")
+    
+    # Calculate maturity date
+    dep_obj = datetime.date.today()
+    dep_obj_parsed = datetime.datetime.strptime(dep_date, "%Y-%m-%d").date()
+    months_to_add = int(dep_tenure)
+    maturity = (dep_obj_parsed + datetime.timedelta(days=months_to_add * 30)).strftime("%Y-%m-%d")
+    
+    dep_notes = st.text_input("Notes (optional)", key="dep_notes")
+    
+    if st.button("Add Bank Deposit"):
+        # Add to Bank Deposits table
+        add_row("BANK DEPOSITS", {
+            "Sr No": get_next_sr_no("BANK DEPOSITS"),
+            "Date": dep_date,
+            "Bank Name": dep_bank,
+            "Deposit Type": dep_type,
+            "Amount": dep_amt,
+            "Tenure (months)": int(dep_tenure),
+            "Interest Rate (%)": dep_rate,
+            "Maturity Date": maturity,
+            "Notes": dep_notes,
+        })
+        
+        # Automatically add to OTHER INCOME as well
+        add_row("OTHER INCOME", {
+            "Sr No": get_next_sr_no("OTHER INCOME"),
+            "Date": dep_date,
+            "Income Type": f"{dep_type} - {dep_bank}",
+            "Amount": dep_amt,
+            "Notes": f"Auto: {dep_notes}" if dep_notes else "Auto-added from Bank Deposits",
+        })
+        
+        est_interest = dep_amt * (dep_rate / 100) * (dep_tenure / 12)
+        st.success(f"✅ {dep_type} of ₹{dep_amt:,.0f} added to {dep_bank}! (Est. Interest: ₹{est_interest:,.0f})")
+        st.success(f"✅ Also added as income entry in 'Other Income'")
+        st.rerun()
+    
+    st.info("📊 View all deposits in the **Dashboard** tab for a complete overview.")
 
 # ── TAB: GOALS ─────────────────────────────────────────────────────────────────
 with tab_goals:
@@ -1004,6 +1098,7 @@ with tab_dashboard:
     df_inc = filter_df(st.session_state.data["OTHER INCOME"].copy(),   period=period)
     df_exp = filter_df(st.session_state.data["EXPENSES"].copy(),       period=period)
     df_inv = filter_df(st.session_state.data["SHARES and FUNDS"].copy(), period=period)
+    df_dep = filter_df(st.session_state.data["BANK DEPOSITS"].copy(),  period=period)
 
     total_salary    = df_sal["Salary Credited"].sum()
     total_other_inc = df_inc["Amount"].sum()
@@ -1090,6 +1185,25 @@ with tab_dashboard:
                      labels={"Total Amount Invested": "Amount (₹)"})
         fig.update_layout(margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
+
+    # Bank Deposits (FD/RD) breakdown
+    st.markdown("#### Bank Deposits (FD/RD)")
+    if not df_dep.empty:
+        bank_grp = df_dep.groupby("Bank Name")["Amount"].sum().reset_index().sort_values("Amount", ascending=False)
+        fig = px.pie(bank_grp, values="Amount", names="Bank Name", hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    labels={"Amount": "Amount (₹)"})
+        fig.update_layout(margin=dict(t=10, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # Show details table
+        with st.expander("📊 FD/RD Details"):
+            dep_detail = df_dep[["Bank Name", "Deposit Type", "Amount", "Interest Rate (%)", 
+                                  "Tenure (months)", "Maturity Date"]].copy()
+            dep_detail["Amount"] = dep_detail["Amount"].apply(lambda x: f"₹{x:,.0f}")
+            st.dataframe(dep_detail, use_container_width=True, hide_index=True)
+    else:
+        st.info("No bank deposits logged yet.")
 
     # Budget vs Actual
     if st.session_state.budgets:

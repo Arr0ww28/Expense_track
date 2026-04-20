@@ -51,7 +51,7 @@ df_income.rename(columns={
     "Amount": "amount", "Notes": "notes"
 }).to_sql("other_income", conn, if_exists="replace", index=False)
 
-# EXPENSES → expenses
+# EXPENSES → expensest
 df_expense.rename(columns={
     "Sr No": "sr_no", "Date": "date", "Expense Type": "expense_type",
     "Amount": "amount", "Notes": "notes"
