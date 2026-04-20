@@ -1117,10 +1117,11 @@ with tab_dashboard:
               delta_color="inverse")
     m4.metric("Savings Rate",   f"{savings_rate:.1f}%")
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Salary",        f"₹{total_salary:,.0f}")
-    c2.metric("Other Income",  f"₹{total_other_inc:,.0f}")
-    c3.metric("Liquid Balance",f"₹{liquid:,.0f}")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Liquid Balance",f"₹{liquid:,.0f}")
+    c2.metric("Salary",        f"₹{total_salary:,.0f}")
+    c3.metric("Other Income",  f"₹{total_other_inc:,.0f}")
+    c4.metric("Bank Deposits",       f"₹{df_dep['Amount'].sum():,.0f}")
 
     st.divider()
 
@@ -1168,6 +1169,7 @@ with tab_dashboard:
         exp_m = _monthly(df_exp_all, "Amount");          exp_m["Type"] = "Expenses"
 
         trend_df = pd.concat([sal_m, inc_m, exp_m])
+        trend_df = trend_df.sort_values("Month")
         trend_df["Month"] = trend_df["Month"].dt.strftime("%b %Y")
         fig = px.bar(trend_df, x="Month", y="Amount", color="Type", barmode="group",
                      color_discrete_map={"Salary": "#03e6ff",
@@ -1196,12 +1198,6 @@ with tab_dashboard:
         fig.update_layout(margin=dict(t=10, b=10))
         st.plotly_chart(fig, use_container_width=True)
         
-        # Show details table
-        with st.expander("📊 FD/RD Details"):
-            dep_detail = df_dep[["Bank Name", "Deposit Type", "Amount", "Interest Rate (%)", 
-                                  "Tenure (months)", "Maturity Date"]].copy()
-            dep_detail["Amount"] = dep_detail["Amount"].apply(lambda x: f"₹{x:,.0f}")
-            st.dataframe(dep_detail, use_container_width=True, hide_index=True)
     else:
         st.info("No bank deposits logged yet.")
 
