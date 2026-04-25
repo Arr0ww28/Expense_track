@@ -1,0 +1,26 @@
+[
+  {
+    "id": "67387317-55f8-44c8-8a65-9b223c4cb281",
+    "title": "Yamaha R15",
+    "desc": "Bike purchase fund 2",
+    "target": 250210.0,
+    "include_investments": true,
+    "target_date": "2026-09-05"
+  },
+  {
+    "id": "8f542295-6115-4b95-abde-4a7fcf9ab2cb",
+    "title": "TVS Apache RR310",
+    "desc": "Bike purchase fund",
+    "target": 349900.0,
+    "include_investments": true,
+    "target_date": "2026-09-05"
+  },
+  {
+    "id": "de5633c7-b154-464e-a92c-c149a1d62563",
+    "title": "Guerilla 450 RE",
+    "desc": "Bike purchase fund 3",
+    "target": 320000.0,
+    "include_investments": true,
+    "target_date": "2026-10-15"
+  }
+]
